@@ -162,7 +162,11 @@ func TestNoopWhenIdentical(t *testing.T) {
 
 func TestReplacerCached(t *testing.T) {
 	r := newTestRules()
-	if r.For("deepseek-v3", "deepseek-pro") != r.For("deepseek-v3", "deepseek-pro") {
+	// 分两次取再比指针：命中缓存时必须复用同一个 *Replacer，而不是重建一个
+	// 等价实例。两侧存成变量，避免 staticcheck 把它当成恒假比较。
+	first := r.For("deepseek-v3", "deepseek-pro")
+	second := r.For("deepseek-v3", "deepseek-pro")
+	if first != second {
 		t.Fatal("相同 (upstream, public) 应复用同一 Replacer 实例")
 	}
 }

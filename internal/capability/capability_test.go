@@ -154,7 +154,11 @@ func TestFromStatic(t *testing.T) {
 func TestCacheReturnsSameTable(t *testing.T) {
 	c := NewCache(64)
 	raw := "vision:a;audio:b"
-	if c.Get(raw) != c.Get(raw) {
+	// 分两次取再比指针：命中缓存时必须复用同一个 *Map，而不是重新解析出
+	// 一个等值的新对象。两侧存成变量，避免 staticcheck 把它当成恒假比较。
+	first := c.Get(raw)
+	second := c.Get(raw)
+	if first != second {
 		t.Fatal("cache should return the identical pointer")
 	}
 	if !c.Get("").Empty() {
