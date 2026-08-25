@@ -23,6 +23,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ---------- runtime ----------
 FROM gcr.io/distroless/static-debian12:nonroot
 
+# GHCR 靠 image.source 把 Package 关联回仓库页面。CI 里 metadata-action 会自动
+# 注入，这里兜底本地构建的镜像。
+LABEL org.opencontainers.image.source="https://github.com/AIChatfire/remap-service"
+
 COPY --from=builder /out/gateway /gateway
 
 USER nonroot:nonroot
