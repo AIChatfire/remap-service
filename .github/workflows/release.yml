@@ -2,19 +2,21 @@ name: Release
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
+    paths-ignore: ["**.md"]   # 纯文档改动不值得占一个版本号
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（手动触发时使用，如 v0.1.0）"
-        required: true
+        description: "版本号（留空则按最新 v* tag 自增 patch，如 v0.1.0）"
+        required: false
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false   # 发布不中断，避免推到一半留下残缺 tag
 
 permissions:
-  contents: write   # 创建 Release
+  contents: write   # 创建 tag 与 Release
   packages: write   # 推送 GHCR
 
 env:
@@ -22,11 +24,13 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  # 发布前重跑一遍闸门。tag 触发时 CI 不跑，这里必须自带验证，
-  # 否则可能发出一个测试就没过的版本。
+  # 发布前重跑一遍闸门。tag 触发时 CI 不跑，push 到 main 时 CI 是并行而非
+  # 前置，两种情况都不能依赖 CI 的结论，这里必须自带验证。
+  # 逃生阀：commit message 带 [skip release] 时整条链跳过（needs 会级联跳过）。
   verify:
     name: 发布前验证
     runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.head_commit.message, '[skip release]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,28 +46,84 @@ jobs:
           go vet ./...
           go test -race -count=1 -timeout 10m ./...
 
+  # ---------- 版本号与 changelog ----------
+  # 单一解析点：三种触发方式在这里收敛成一个 version，下游只消费不再各自推断。
+  # 这里只计算、不推 tag —— tag 由最后的 release job 随 Release 一起创建，
+  # 构建失败时不会留下指向空 Release 的悬空 tag。
+  version:
+    name: 解析版本号
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      changelog: ${{ steps.log.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 浅克隆拿不到历史 tag，版本号会永远从 v0.0.1 重开
+
+      - name: 计算版本号
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_VERSION" ]]; then
+            version="$INPUT_VERSION"
+            [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]] \
+              || { echo "手动版本号格式非法: $version（应形如 v1.2.3）" >&2; exit 1; }
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            version="${{ github.ref_name }}"
+          else
+            # --sort=-v:refname 而非 git describe：后者取"最近可达的 tag"，
+            # 有合并历史时会挑错版本。仓库零 v* tag 时回落到 v0.0.0 起算。
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+            latest=${latest:-v0.0.0}
+            IFS=. read -r ma mi pa <<< "${latest#v}"
+            version="v${ma}.${mi}.$((pa + 1))"
+          fi
+          # 并发或人工抢跑造成的重名会在推 tag 时才炸，提前拦掉更好定位。
+          if [[ "${{ github.ref_type }}" != "tag" ]] && git rev-parse -q --verify "refs/tags/${version}" >/dev/null; then
+            echo "tag ${version} 已存在，请人工确认后再发" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "解析结果: ${version}"
+
+      - name: 生成 changelog
+        id: log
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          prev=$(git tag --list 'v*' --sort=-v:refname | grep -vFx "$VERSION" | head -n1 || true)
+          if [[ -z "$prev" ]]; then range=HEAD; else range="${prev}..HEAD"; fi
+          echo "区间: ${range}"
+          # 多行内容必须走 heredoc，单行 echo 会在第一个换行处截断。
+          {
+            echo 'changelog<<CHANGELOG_EOF'
+            git log "$range" --pretty='- %s (%h)' --no-merges
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
   # ---------- 多平台二进制 ----------
   binaries:
     name: 交叉编译二进制
-    needs: verify
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # make build 用 git describe 取版本
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: 解析版本号
-        id: v
-        run: echo "version=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
-
       - name: 构建
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -85,11 +145,10 @@ jobs:
           name: binaries
           path: dist/
           retention-days: 7
-
   # ---------- 多架构镜像 ----------
   image:
     name: 推送 GHCR 镜像
-    needs: verify
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,21 +164,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 手动触发时 ref 是 refs/heads/main，type=semver 匹配不到会产出空标签列表
-      # 导致推送直接失败。统一先把版本号解析成变量，再喂给 metadata-action。
-      - name: 解析版本号
-        id: v
-        run: echo "version=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
-
+      # push 到 main 时 ref 是 refs/heads/main，type=semver 匹配不到会产出空
+      # 标签列表并让推送直接失败，因此统一喂上游解析好的 version。
       - name: 生成标签
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.v.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.v.outputs.version }}
-            type=raw,value=latest,enable=${{ !contains(steps.v.outputs.version, '-') }}
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }}
+            type=raw,value=latest,enable=${{ !contains(needs.version.outputs.version, '-') }}
 
       - name: 构建并推送
         uses: docker/build-push-action@v6
@@ -130,32 +185,64 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.v.outputs.version }}
+            VERSION=${{ needs.version.outputs.version }}
             COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ---------- GitHub Release ----------
+  # ---------- 打 tag + GitHub Release ----------
   release:
     name: 创建 Release
-    needs: [binaries, image]
+    needs: [version, binaries, image]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           name: binaries
           path: dist
 
+      # 构建与镜像都过了才落 tag，避免留下指向空 Release 的悬空 tag。
+      # 注：GITHUB_TOKEN 推的 tag 不会触发其他 workflow，下游若有 tag 触发的
+      # 流水线需改用 PAT 或 repository_dispatch。
+      - name: 打 tag
+        if: ${{ github.ref_type != 'tag' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898671+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+
+      # latest 是可变引用，force push 是这里的预期行为。
+      - name: 移动 latest tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git tag -f latest "$VERSION"
+          git push -f origin latest
+
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: ${{ needs.version.outputs.version }}
           files: dist/*
-          generate_release_notes: true
           body: |
+            ## 变更
+
+            ${{ needs.version.outputs.changelog }}
+
             ## 镜像
 
             ```bash
-            docker pull ${{ env.IMAGE }}:${{ github.ref_name }}
+            docker pull ${{ env.IMAGE }}:${{ needs.version.outputs.version }}
             ```
 
             二进制见下方附件，`SHA256SUMS` 可用于校验完整性。
+
