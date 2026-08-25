@@ -13,10 +13,15 @@
 //  1. 模型字段（model / response.model / message.model）整体覆盖为对外模型名；
 //  2. 其余字段走递归扫描，但只处理**短字符串**，且跳过承载生成内容的字段名；
 //  3. 扫描前先做一次 bytes 级预检，不含上游标识的 payload 零成本返回。
+//
+// # 大小写
+//
+// 上述匹配对 ASCII 大小写不敏感。实测上游在不同字段里给出的标识形态并不
+// 统一，精确匹配的失效方式是「静默漏过」——不报错、不降级，只是没脱敏。
+// 字段名（生成内容白名单）同样按小写折叠后比较。
 package sanitize
 
 import (
-	"bytes"
 	"hash/maphash"
 	"sort"
 	"strings"
@@ -49,9 +54,30 @@ var contentFields = map[string]struct{}{
 }
 
 // IsContentField 报告某字段名是否承载模型生成内容。
+//
+// 按 ASCII 小写折叠后比较：字段名的大小写同样不可信，若上游返回 "Content"
+// 而这里判负，该字段就会退回「短值即替换」的通用规则，等于允许改写生成内容 ——
+// 这个方向的误判后果比漏脱敏更严重，因此宁可放宽。
 func IsContentField(name string) bool {
-	_, ok := contentFields[name]
+	if _, ok := contentFields[name]; ok {
+		return true
+	}
+	if !hasUpperASCII(name) {
+		return false
+	}
+	_, ok := contentFields[strings.ToLower(name)]
 	return ok
+}
+
+// hasUpperASCII 报告 s 是否含 ASCII 大写字母。绝大多数字段名本就是小写，
+// 这次扫描让常见路径免于 strings.ToLower 的分配。
+func hasUpperASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return true
+		}
+	}
+	return false
 }
 
 // cacheKey 用结构体做键，避免每次查找都拼接字符串产生分配。
@@ -219,10 +245,12 @@ func (r *Rules) MaxValueLen() int {
 }
 
 // Replacer 是一次请求维度的替换器（上游模型 -> 对外模型），可并发只读使用。
+//
+// 匹配对 ASCII 大小写不敏感：上游在不同字段里给出的标识形态并不统一
+// （model 给 deepseek-v3，错误 message 给 DeepSeek-V3），精确匹配会让
+// 后者静默漏过。详见 foldMatcher 的说明。
 type Replacer struct {
-	rep *strings.Replacer
-	// needles 是全部待匹配的源串，用于 bytes 级快速预检。
-	needles     [][]byte
+	m           *foldMatcher
 	upstream    string
 	public      string
 	maxValueLen int
@@ -266,12 +294,7 @@ func (p *Replacer) MayMatch(b []byte) bool {
 	if p == nil || p.noop || len(b) == 0 {
 		return false
 	}
-	for _, n := range p.needles {
-		if bytes.Contains(b, n) {
-			return true
-		}
-	}
-	return false
+	return p.m.mayMatch(bytesToString(b))
 }
 
 // MayMatchString 是 MayMatch 的字符串版本。
@@ -279,12 +302,7 @@ func (p *Replacer) MayMatchString(s string) bool {
 	if p == nil || p.noop || s == "" {
 		return false
 	}
-	for _, n := range p.needles {
-		if strings.Contains(s, bytesToString(n)) {
-			return true
-		}
-	}
-	return false
+	return p.m.mayMatch(s)
 }
 
 // Apply 对文本执行替换。无匹配时返回原字符串，不产生分配。
@@ -292,7 +310,7 @@ func (p *Replacer) Apply(s string) string {
 	if p == nil || p.noop || s == "" {
 		return s
 	}
-	return p.rep.Replace(s)
+	return p.m.replace(s)
 }
 
 // ApplyShort 只在字符串「足够短」时执行替换，否则原样返回。
@@ -302,7 +320,7 @@ func (p *Replacer) ApplyShort(s string) string {
 	if p == nil || p.noop || s == "" || len(s) > p.MaxValueLen() {
 		return s
 	}
-	return p.rep.Replace(s)
+	return p.m.replace(s)
 }
 
 // For 返回把 upstream（含别名）替换为 public 的替换器。
@@ -310,6 +328,8 @@ func (r *Rules) For(upstream, public string) *Replacer {
 	if r == nil {
 		return noopReplacer
 	}
+	// 用 EqualFold：上游名与对外名仅大小写不同时仍需替换，因为响应里
+	// 出现的是上游形态，直接放行会把 DeepSeek-V3 原样透给客户端。
 	if upstream == public && len(r.global) == 0 && len(r.aliases[upstream]) == 0 {
 		return noopReplacer
 	}
@@ -352,6 +372,8 @@ func (r *Rules) For(upstream, public string) *Replacer {
 func (r *Rules) build(upstream, public string) *Replacer {
 	// 收集所有需要被替换成 public 的源串。
 	srcs := make([]string, 0, 4+len(r.aliases[upstream]))
+	// 这里必须精确比较：仅大小写不同（DeepSeek-V3 vs deepseek-v3）时规则
+	// 依然要建立，响应里出现的是上游形态，丢掉规则等于原样透给客户端。
 	if upstream != "" && upstream != public {
 		srcs = append(srcs, upstream)
 	}
@@ -361,6 +383,9 @@ func (r *Rules) build(upstream, public string) *Replacer {
 		}
 	}
 
+	// 精确去重。不按小写折叠：折叠后 deepseek-v3 与 DeepSeek-V3 看似等价，
+	// 但当对外名恰是其中一种形态时，留错那一条会让另一种形态漏过。重复的
+	// 等价规则只是让 findAt 多比一次，代价远小于漏脱敏。
 	seen := make(map[string]struct{}, len(srcs))
 	uniq := srcs[:0]
 	for _, s := range srcs {
@@ -374,22 +399,24 @@ func (r *Rules) build(upstream, public string) *Replacer {
 	// 留下一个 "-250101" 的尾巴造成脱敏不完整。
 	sortByLenDesc(uniq)
 
-	pairs := make([]string, 0, len(uniq)*2+len(r.global)*2)
-	needles := make([][]byte, 0, len(uniq)+len(r.global))
+	pairs := make([][2]string, 0, len(uniq)+len(r.global))
 	for _, s := range uniq {
-		pairs = append(pairs, s, public)
-		needles = append(needles, []byte(s))
+		pairs = append(pairs, [2]string{s, public})
 	}
-	for _, g := range r.global {
-		pairs = append(pairs, g[0], g[1])
-		needles = append(needles, []byte(g[0]))
-	}
-	if len(pairs) == 0 {
+	pairs = append(pairs, r.global...)
+
+	// 全局对与模型别名混在一起后必须重新排一次序：长串优先是跨两类规则
+	// 的全局约束，只在各自集合内有序不足以保证最长匹配。
+	sort.SliceStable(pairs, func(i, j int) bool {
+		return len(pairs[i][0]) > len(pairs[j][0])
+	})
+
+	m := newFoldMatcher(pairs)
+	if m == nil {
 		return noopReplacer
 	}
 	return &Replacer{
-		rep:         strings.NewReplacer(pairs...),
-		needles:     needles,
+		m:           m,
 		upstream:    upstream,
 		public:      public,
 		maxValueLen: r.maxValueLen,

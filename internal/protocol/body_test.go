@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -124,6 +125,87 @@ func TestSanitizeModelFieldAlwaysOverwritten(t *testing.T) {
 		t.Fatal("应报告发生改动")
 	}
 	assertField(t, out, "model", "pub")
+}
+
+// --- 核心：两步职责不重叠（对外名与上游名交叉时不产生重复片段）---
+
+// 用户实际报告的组合：public 是 upstream 的超串。
+// 步骤 ① 把 model 覆盖成 DeepSeek-V3-20260813 后，若步骤 ② 再扫一遍，
+// 会命中其中的 DeepSeek-V3 并二次替换，产出 …-20260813-20260813。
+func TestSanitizeModelPathExemptFromSubstringScan(t *testing.T) {
+	const (
+		upstream = "deepseek-v3"
+		public   = "DeepSeek-V3-20260813"
+	)
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+		t.Run(path, func(t *testing.T) {
+			s := Detect(path)
+			rep := newRep(t, upstream, public)
+			for _, mp := range s.ModelPaths {
+				in := []byte(`{"` + mp + `":"` + upstream + `"}`)
+				if mp == "response.model" || mp == "message.model" {
+					in = []byte(`{"` + strings.SplitN(mp, ".", 2)[0] + `":{"model":"` + upstream + `"}}`)
+				}
+				out, changed := s.Sanitize(in, public, rep)
+				if !changed {
+					t.Fatalf("%s: 应报告发生改动", mp)
+				}
+				assertField(t, out, mp, public)
+			}
+		})
+	}
+}
+
+// 客户端已传 public 形态时，① 无需改写，② 也不能碰 —— 整体应报告未改动。
+func TestSanitizeIdempotentWhenPublicContainsUpstream(t *testing.T) {
+	s := Detect("/v1/chat/completions")
+	rep := newRep(t, "deepseek-v3", "DeepSeek-V3-20260813")
+	in := []byte(`{"model":"DeepSeek-V3-20260813"}`)
+
+	out, changed := s.Sanitize(in, "DeepSeek-V3-20260813", rep)
+	assertField(t, out, "model", "DeepSeek-V3-20260813")
+	if changed {
+		t.Error("值已是最终形态，不应报告改动（会造成上报假信号）")
+	}
+	// 二次调用必须稳定
+	out2, _ := s.Sanitize(out, "DeepSeek-V3-20260813", rep)
+	if !bytes.Equal(out, out2) {
+		t.Errorf("非幂等:\n  1st %s\n  2nd %s", out, out2)
+	}
+}
+
+// 非模型路径（id / 错误文本）不在 covered 里，仍须正常替换且只替换一次。
+func TestSanitizeNonModelPathsStillReplacedOnce(t *testing.T) {
+	s := Detect("/v1/chat/completions")
+	rep := newRep(t, "deepseek-v3", "DeepSeek-V3-20260813")
+	in := []byte(`{"model":"deepseek-v3","id":"chatcmpl-deepseek-v3-abc",` +
+		`"error":{"message":"model deepseek-v3 not found"}}`)
+
+	out, changed := s.Sanitize(in, "DeepSeek-V3-20260813", rep)
+	if !changed {
+		t.Fatal("应报告发生改动")
+	}
+	assertField(t, out, "model", "DeepSeek-V3-20260813")
+	assertField(t, out, "id", "chatcmpl-DeepSeek-V3-20260813-abc")
+	assertField(t, out, "error.message", "model DeepSeek-V3-20260813 not found")
+	if n := bytes.Count(out, []byte("20260813")); n != 3 {
+		t.Errorf("对外名出现 %d 次，期望 3 次（无重复后缀累积）: %s", n, out)
+	}
+}
+
+// 反向包含：public 是 upstream 的子串。此时上游名本身以 public 开头，
+// 跳过它会让上游形态泄漏，因此必须照常替换。
+func TestSanitizeModelPathWhenPublicIsSubstring(t *testing.T) {
+	s := Detect("/v1/chat/completions")
+	rep := newRep(t, "deepseek-v3-preview", "deepseek-v3")
+	in := []byte(`{"model":"deepseek-v3-preview","id":"req-deepseek-v3-preview-1"}`)
+
+	out, _ := s.Sanitize(in, "deepseek-v3", rep)
+	assertField(t, out, "model", "deepseek-v3")
+	assertField(t, out, "id", "req-deepseek-v3-1")
+	if bytes.Contains(out, []byte("preview")) {
+		t.Errorf("上游形态泄漏: %s", out)
+	}
 }
 
 // --- 核心：不篡改模型生成的内容 ---

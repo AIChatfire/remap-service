@@ -47,15 +47,35 @@ const maxScanDepth = 12
 //
 // 步骤 ② 刻意不碰长字符串与 content/text/delta 之类的字段，
 // 避免把模型生成的正文改掉。详见 sanitize 包的文档。
+//
+// # 两步的职责不重叠
+//
+// 步骤 ① 已整体覆盖的路径不再参与步骤 ② 的子串扫描。这两步对模型字段的
+// 语义本就不同 —— ① 是「这个字段的值就是对外模型名」，② 是「这段文本里
+// 可能夹着上游标识」。让 ② 再扫一遍 ① 的成果没有任何收益，却会在对外名
+// 包含上游名时（public=DeepSeek-V3-20260813 含 upstream=deepseek-v3）
+// 把已经正确的值再替换一次，产出 …-20260813-20260813 这样的重复后缀。
 func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]byte, bool) {
 	out := body
 	changed := false
+
+	// covered 记录已被 ① 整体覆盖的路径，② 必须跳过它们。
+	// ModelPaths 恒为个位数，线性查找比建 map 更快且零分配。
+	var covered []string
 
 	// ① 模型字段：整体覆盖。即使 rep 为 noop（上游名 == 对外名）也要执行，
 	//    因为上游可能返回带版本后缀的变体（deepseek-v3-250101）。
 	for _, p := range s.ModelPaths {
 		r := gjson.GetBytes(out, p)
-		if !r.Exists() || r.Type != gjson.String || r.Str == public {
+		if !r.Exists() || r.Type != gjson.String {
+			continue
+		}
+		// 字段存在即纳入 covered：值已等于 public 时虽无需改写，
+		// 但它同样是「已达最终形态」，仍要挡住 ② 的子串扫描。
+		covered = append(covered, p)
+		// 用精确比较：仅大小写不同（DeepSeek-Pro vs deepseek-pro）时也要
+		// 覆盖，否则上游形态会原样透给客户端。
+		if r.Str == public {
 			continue
 		}
 		if v, err := sjson.SetBytesOptions(out, p, public, setOpts); err == nil {
@@ -65,7 +85,7 @@ func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]b
 
 	// ② 其余短值：仅在确实可能命中时才扫描，避免无谓的解析开销。
 	if rep.MayMatch(out) {
-		if v, ok := scanAndReplace(out, rep); ok {
+		if v, ok := scanAndReplace(out, rep, covered); ok {
 			out, changed = v, true
 		}
 	}
@@ -77,12 +97,13 @@ func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]b
 // 判定条件（全部满足才替换）：
 //   - 值是字符串且包含待替换的源串；
 //   - 值长度不超过 rep.MaxValueLen()；
-//   - 所在字段名不在生成内容白名单里（content / text / delta …）。
-func scanAndReplace(body []byte, rep *sanitize.Replacer) ([]byte, bool) {
+//   - 所在字段名不在生成内容白名单里（content / text / delta …）；
+//   - 所在路径不在 covered 里（已被模型字段覆盖步骤处理过）。
+func scanAndReplace(body []byte, rep *sanitize.Replacer, covered []string) ([]byte, bool) {
 	var paths []string
 	var values []string
 
-	collect(gjson.ParseBytes(body), "", "", rep, 0, &paths, &values)
+	collect(gjson.ParseBytes(body), "", "", rep, covered, 0, &paths, &values)
 	if len(paths) == 0 {
 		return body, false
 	}
@@ -100,7 +121,7 @@ func scanAndReplace(body []byte, rep *sanitize.Replacer) ([]byte, bool) {
 //
 // path 为 sjson 路径，key 为当前值所属的字段名（数组元素继承父字段名，
 // 因为 ["a","b"] 这类数组里的元素同样属于该字段的语义范畴）。
-func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, depth int, paths, values *[]string) {
+func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, covered []string, depth int, paths, values *[]string) {
 	if depth > maxScanDepth {
 		return
 	}
@@ -108,6 +129,9 @@ func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, depth int
 	case gjson.String:
 		if sanitize.IsContentField(key) {
 			return // 生成内容，无论长短都不动
+		}
+		if isCovered(path, covered) {
+			return // 模型字段已整体覆盖，二次子串替换只会产生重复片段
 		}
 		if len(v.Str) > rep.MaxValueLen() {
 			return // 过长，视为生成内容
@@ -121,7 +145,7 @@ func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, depth int
 		if v.IsArray() {
 			i := 0
 			v.ForEach(func(_, item gjson.Result) bool {
-				collect(item, joinIndex(path, i), key, rep, depth+1, paths, values)
+				collect(item, joinIndex(path, i), key, rep, covered, depth+1, paths, values)
 				i++
 				return true
 			})
@@ -129,10 +153,23 @@ func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, depth int
 		}
 		v.ForEach(func(k, item gjson.Result) bool {
 			name := k.String()
-			collect(item, joinKey(path, name), name, rep, depth+1, paths, values)
+			collect(item, joinKey(path, name), name, rep, covered, depth+1, paths, values)
 			return true
 		})
 	}
+}
+
+// isCovered 报告 path 是否已被模型字段覆盖步骤处理过。
+//
+// covered 元素恒为个位数且是 Spec.ModelPaths 的原样拷贝，
+// 与 collect 拼出的路径格式一致（点分、无下标），可直接精确比较。
+func isCovered(path string, covered []string) bool {
+	for _, c := range covered {
+		if c == path {
+			return true
+		}
+	}
+	return false
 }
 
 // joinKey 拼接对象字段路径，转义 sjson 的特殊字符。
