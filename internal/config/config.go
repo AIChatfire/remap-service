@@ -109,6 +109,19 @@ type Obs struct {
 	LogLevel         string
 	LogFormat        string
 	LogUpstreamModel bool
+
+	// ExcludedURLs 是不产生 trace 与指标的路径关键字（ASCII 大小写无关的子串匹配）。
+	//
+	// 健康检查、就绪探针、心跳这类轮询请求的频率往往比真实业务高一个数量级，
+	// 却没有任何诊断价值：它们会稀释 P99、抬高上报量、污染 trace 列表。
+	// 命中的请求仍然正常代理，只是不记录可观测数据。
+	ExcludedURLs []string
+
+	// MetricInterval 是指标上报周期。
+	//
+	// 上报本身在独立 goroutine，不占请求路径；调大只减少出网次数，
+	// 代价是看板的数据新鲜度。
+	MetricInterval time.Duration
 }
 
 // Load 从环境变量构建配置。envFile 为空时默认尝试 ./.env。
@@ -159,6 +172,8 @@ func Load(envFile string) (*Config, error) {
 			LogLevel:         envStr("LOG_LEVEL", "info"),
 			LogFormat:        envStr("LOG_FORMAT", "json"),
 			LogUpstreamModel: envBool("LOG_UPSTREAM_MODEL", true),
+			ExcludedURLs:     envList("EXCLUDED_URLS"),
+			MetricInterval:   envDur("OBS_METRIC_INTERVAL", 60*time.Second),
 		},
 	}
 
@@ -197,6 +212,11 @@ func (c *Config) normalizeObs() {
 	}
 	if c.Obs.LogfireRegion == "" {
 		c.Obs.LogfireRegion = "us"
+	}
+	// 间隔过小会让空周期报错更频繁、出网次数陡增，且对看板没有实际收益。
+	// 这里取 5s 作为下限而非报错：它是性能取舍，不是配置错误。
+	if c.Obs.MetricInterval < 5*time.Second {
+		c.Obs.MetricInterval = 5 * time.Second
 	}
 }
 
@@ -264,6 +284,7 @@ func (c *Config) Summary() []any {
 		"sanitize", c.SanitizeEnabled(),
 		"strict_mapping", c.Mapping.Strict,
 		"obs", c.Obs.Enabled,
+		"obs_excluded_urls", c.Obs.ExcludedURLs,
 	}
 }
 

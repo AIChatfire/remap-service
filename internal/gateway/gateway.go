@@ -111,6 +111,9 @@ type state struct {
 	sseEvents  int64
 	rewrites   int64
 	err        error
+	// mx 是本次请求实际使用的指标集合。命中 EXCLUDED_URLS 时它是空集合，
+	// 所有上报退化为 no-op —— 排除判断只在 ServeHTTP 入口做一次。
+	mx *obs.Metrics
 }
 
 // modelOther 是未声明模型在指标里的归一值。
@@ -135,7 +138,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	route := protocol.RouteLabel(r.URL.Path)
 
-	ctx, span := g.o.Tracer.Start(r.Context(), "gateway "+route,
+	// 排除路径（健康检查、探针、心跳）在此一次性降级为 no-op tracer 与空指标
+	// 集合，后续所有上报点无需再判断。请求本身照常代理。
+	mx := g.o.MetricsFor(r.URL.Path)
+
+	ctx, span := g.o.TracerFor(r.URL.Path).Start(r.Context(), "gateway "+route,
 		trace.WithSpanKind(trace.SpanKindServer),
 		trace.WithAttributes(
 			attribute.String("http.request.method", r.Method),
@@ -145,7 +152,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// metricModel 默认取归一值：无 model 字段的端点（/v1/models 等）
 	// 与未声明的模型名共用同一条时间序列。
-	st := &state{route: route, start: start, metricModel: modelOther}
+	st := &state{route: route, start: start, metricModel: modelOther, mx: mx}
 
 	// 闸门必须在读取请求体之前获取：body 一旦读入就占用了
 	// 最多 MAX_BODY_BYTES 的内存，此时再拒绝已经失去保护意义。
@@ -153,21 +160,21 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		st.outcome = "overloaded"
 		status := writeOverloaded(w, overloadRetryAfter)
-		obs.Add(ctx, g.o.Metrics.Rejected, 1, st.metricAttrs(st.outcome, status))
+		obs.Add(ctx, mx.Rejected, 1, st.metricAttrs(st.outcome, status))
 		g.log(st, status, r)
 		return
 	}
 	defer release()
 
-	obs.AddUpDown(ctx, g.o.Metrics.InFlight, 1)
-	defer obs.AddUpDown(ctx, g.o.Metrics.InFlight, -1)
+	obs.AddUpDown(ctx, mx.InFlight, 1)
+	defer obs.AddUpDown(ctx, mx.InFlight, -1)
 
 	status := g.handle(ctx, w, r, st, span)
 
 	a := st.metricAttrs(st.outcome, status)
-	obs.Add(ctx, g.o.Metrics.Requests, 1, a)
-	obs.Record(ctx, g.o.Metrics.Duration, msSince(start), a)
-	obs.Add(ctx, g.o.Metrics.BytesIn, st.bytesIn, a)
+	obs.Add(ctx, mx.Requests, 1, a)
+	obs.Record(ctx, mx.Duration, msSince(start), a)
+	obs.Add(ctx, mx.BytesIn, st.bytesIn, a)
 
 	g.log(st, status, r)
 }
@@ -229,7 +236,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	if err != nil {
 		st.outcome, st.err = "upstream_error", err
-		obs.Add(ctx, g.o.Metrics.UpstreamErr, 1, st.metricAttrs("transport", 0))
+		obs.Add(ctx, st.mx.UpstreamErr, 1, st.metricAttrs("transport", 0))
 		span.SetStatus(codes.Error, err.Error())
 		code, msg := classifyUpstreamError(ctx, err)
 		return writeError(w, code, "upstream_error", msg)
@@ -243,14 +250,14 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			cancel()
 			resp, cancel = r2, c2
 			st.applyPlan(plan)
-			obs.Add(ctx, g.o.Metrics.Failover, 1, st.metricAttrs("failover", resp.StatusCode))
+			obs.Add(ctx, st.mx.Failover, 1, st.metricAttrs("failover", resp.StatusCode))
 		}
 	}
 	defer cancel()
 	defer resp.Body.Close()
 
 	st.ttfb = time.Since(sendAt)
-	obs.Record(ctx, g.o.Metrics.TTFB, float64(st.ttfb.Microseconds())/1000.0,
+	obs.Record(ctx, st.mx.TTFB, float64(st.ttfb.Microseconds())/1000.0,
 		st.metricAttrs("ok", resp.StatusCode))
 	span.SetAttributes(
 		attribute.Int("http.response.status_code", resp.StatusCode),

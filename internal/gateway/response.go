@@ -57,9 +57,9 @@ func (g *Gateway) pipeStream(
 	st.rewrites = stats.Rewrote
 
 	a := st.metricAttrs("stream", resp.StatusCode)
-	obs.Add(ctx, g.o.Metrics.SSEEvents, stats.Events, a)
-	obs.Add(ctx, g.o.Metrics.BytesOut, stats.Bytes, a)
-	obs.Add(ctx, g.o.Metrics.Rewrites, stats.Rewrote, a)
+	obs.Add(ctx, st.mx.SSEEvents, stats.Events, a)
+	obs.Add(ctx, st.mx.BytesOut, stats.Bytes, a)
+	obs.Add(ctx, st.mx.Rewrites, stats.Rewrote, a)
 	span.SetAttributes(
 		attribute.Int64("gateway.sse.events", stats.Events),
 		attribute.Int64("gateway.sse.bytes", stats.Bytes),
@@ -69,7 +69,7 @@ func (g *Gateway) pipeStream(
 		st.err = err
 		st.outcome = "stream_broken"
 		span.SetStatus(codes.Error, err.Error())
-		obs.Add(ctx, g.o.Metrics.UpstreamErr, 1, a)
+		obs.Add(ctx, st.mx.UpstreamErr, 1, a)
 	}
 	return resp.StatusCode
 }
@@ -94,7 +94,7 @@ func (g *Gateway) pipeBuffered(
 		if err != nil {
 			st.err = err
 		}
-		obs.Add(ctx, g.o.Metrics.BytesOut, n, st.metricAttrs(st.outcome, resp.StatusCode))
+		obs.Add(ctx, st.mx.BytesOut, n, st.metricAttrs(st.outcome, resp.StatusCode))
 		return resp.StatusCode
 	}
 
@@ -132,8 +132,8 @@ func (g *Gateway) pipeBuffered(
 	}
 
 	a := st.metricAttrs(st.outcome, resp.StatusCode)
-	obs.Add(ctx, g.o.Metrics.BytesOut, int64(n), a)
-	obs.Add(ctx, g.o.Metrics.Rewrites, st.rewrites, a)
+	obs.Add(ctx, st.mx.BytesOut, int64(n), a)
+	obs.Add(ctx, st.mx.Rewrites, st.rewrites, a)
 	if resp.StatusCode >= 400 {
 		span.SetStatus(codes.Error, "upstream status "+strconv.Itoa(resp.StatusCode))
 	}

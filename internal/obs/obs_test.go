@@ -118,7 +118,7 @@ func TestAttrsLowCardinality(t *testing.T) {
 			}
 			for _, dp := range sum.DataPoints {
 				for _, kv := range dp.Attributes.ToSlice() {
-					labels = append(labels, string(kv.Key)+"="+kv.Value.Emit())
+					labels = append(labels, string(kv.Key)+"="+kv.Value.String())
 				}
 			}
 		}
@@ -136,5 +136,51 @@ func TestAttrsLowCardinality(t *testing.T) {
 	}
 	if len(labels) != 4 {
 		t.Errorf("标签数 = %d，期望恰好 4 个低基数维度: %s", len(labels), joined)
+	}
+}
+
+func TestExcludedMatchesSubstringFoldCase(t *testing.T) {
+	p := &Provider{excluded: []string{"health", "metrics", "poll"}}
+
+	cases := map[string]bool{
+		"/health":              true,
+		"/healthz":             true,
+		"/HEALTHZ":             true, // 大小写无关
+		"/v1/inner/Metrics":    true, // 子串命中即可
+		"/api/poll?wait=30":    true,
+		"/v1/chat/completions": false,
+		"/v1/models":           false,
+		"":                     false, // 空路径不视为命中
+	}
+	for path, want := range cases {
+		if got := p.Excluded(path); got != want {
+			t.Errorf("Excluded(%q) = %v，期望 %v", path, got, want)
+		}
+	}
+}
+
+func TestExcludedPathGetsNoopExits(t *testing.T) {
+	p := &Provider{excluded: []string{"health"}, Metrics: newNoopMetrics()}
+
+	if p.MetricsFor("/healthz") != noopMetrics {
+		t.Error("排除路径应拿到 noopMetrics，否则指标仍会带上排除路径的维度")
+	}
+	if p.MetricsFor("/v1/chat/completions") == noopMetrics {
+		t.Error("正常路径不应被降级成 noopMetrics")
+	}
+	// nil Provider 必须也安全：未启用可观测性时热路径走同一条分支。
+	var nilP *Provider
+	if nilP.MetricsFor("/anything") != noopMetrics {
+		t.Error("nil Provider 应返回 noopMetrics")
+	}
+	if nilP.Excluded("/health") {
+		t.Error("nil Provider 的 Excluded 应为 false，不得 panic")
+	}
+}
+
+func TestExcludedEmptyListDisablesFiltering(t *testing.T) {
+	p := &Provider{Metrics: newNoopMetrics()}
+	if p.Excluded("/healthz") {
+		t.Error("未配置 EXCLUDED_URLS 时不应排除任何路径")
 	}
 }
