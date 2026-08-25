@@ -11,6 +11,8 @@ const (
 	MapHeader = "X-Model-Map"
 	// BaseHeader 覆盖本次请求的上游地址。
 	BaseHeader = "X-Upstream-Base"
+	// CapHeader 承载「能力 -> 上游模型」的声明，用于按能力做故障切换。
+	CapHeader = "X-Model-Capability"
 )
 
 // credentialHeaders 是可能承载客户端凭据的请求头，按优先级排列。
@@ -72,7 +74,9 @@ func isCredentialHeader(name string) bool {
 
 // isInternalHeader 报告某个头名是否为网关内部协议头。
 func isInternalHeader(name string) bool {
-	return strings.EqualFold(name, MapHeader) || strings.EqualFold(name, BaseHeader)
+	return strings.EqualFold(name, MapHeader) ||
+		strings.EqualFold(name, BaseHeader) ||
+		strings.EqualFold(name, CapHeader)
 }
 
 // resolveBase 决定本次请求的上游地址。

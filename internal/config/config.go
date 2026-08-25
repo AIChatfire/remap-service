@@ -58,6 +58,12 @@ type Mapping struct {
 	// FailoverOnError 为 true 时，首选上游返回 5xx/429 或连接失败，
 	// 会用 Fallback 模型重试一次。仅在配置了 Fallback 时有意义。
 	FailoverOnError bool
+	// Capabilities 是「能力 -> 上游模型」的静态声明，
+	// 在 X-Model-Capability 头缺失时生效。
+	// 键为 vision / audio / video / tools / file（含中文与常见别名）。
+	// 上游因某能力报错时切到对应模型重试；file 能力另有前置路由
+	// —— 请求体含 file_id 时直接改走，不等报错。
+	Capabilities map[string][]string
 }
 
 // Sanitize 控制响应脱敏。
@@ -126,6 +132,7 @@ func Load(envFile string) (*Config, error) {
 			Models:          envMapList("MODEL_MAP"),
 			Fallback:        envPipeList("MODEL_MAP_FALLBACK"),
 			FailoverOnError: envBool("MODEL_MAP_FAILOVER", false),
+			Capabilities:    envMapList("MODEL_CAPABILITY"),
 		},
 		Sanitize: Sanitize{
 			Off:         envBool("SANITIZE_OFF", false),

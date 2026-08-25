@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/betterme/remap-service/internal/capability"
 	"github.com/betterme/remap-service/internal/config"
 	"github.com/betterme/remap-service/internal/mapping"
 	"github.com/betterme/remap-service/internal/obs"
@@ -41,8 +42,11 @@ type Gateway struct {
 	rules    *sanitize.Rules
 	mapCache *mapping.Cache
 	static   *mapping.Table
-	gate     *gate
-	o        *obs.Provider
+	// capCache 解析 X-Model-Capability 头，capStatic 是其静态兜底。
+	capCache  *capability.Cache
+	capStatic *capability.Map
+	gate      *gate
+	o         *obs.Provider
 }
 
 // New 构建网关。
@@ -56,10 +60,12 @@ func New(cfg *config.Config, client *upstream.Client, o *obs.Provider) *Gateway 
 			cfg.Sanitize.DropHeaders,
 			cfg.Sanitize.MaxValueLen,
 		),
-		mapCache: mapping.NewCache(1024),
-		static:   mapping.FromStatic(cfg.Mapping.Models, cfg.Mapping.Fallback),
-		gate:     newGate(cfg.Limits.MaxInflight),
-		o:        o,
+		mapCache:  mapping.NewCache(1024),
+		static:    mapping.FromStatic(cfg.Mapping.Models, cfg.Mapping.Fallback),
+		capCache:  capability.NewCache(256),
+		capStatic: capability.FromStatic(cfg.Mapping.Capabilities),
+		gate:      newGate(cfg.Limits.MaxInflight),
+		o:         o,
 	}
 }
 
@@ -91,6 +97,10 @@ type state struct {
 	metricModel string
 	// matchKind 记录模型映射命中的级别（精确 / 通配 / 兜底 / 未命中）。
 	matchKind mapping.MatchKind
+	// caps 是本次请求体用到的能力集合（仅统计已声明专用模型的那些）。
+	caps capability.Set
+	// capUsed 非 None 时，表示本次已切到该能力的专用模型。
+	capUsed capability.Kind
 	// failedOver 标记本次请求是否发生了故障切换。
 	failedOver bool
 	stream     bool
@@ -205,7 +215,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 		return writeError(w, http.StatusInternalServerError, "gateway_error", "failed to build upstream request")
 	}
 
-	plan := g.planFailover(st)
+	plan := g.planFailover(r, st)
 
 	sendAt := time.Now()
 	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
@@ -214,8 +224,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	if err != nil && plan.enabled {
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st); ok {
 			resp, cancel, err = r2, c2, nil
-			st.failedOver, st.upstreamModel, st.matchKind =
-				true, plan.model, mapping.MatchFallback
+			st.applyPlan(plan)
 		}
 	}
 	if err != nil {
@@ -228,13 +237,12 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	// 状态码层失败：响应头已到但正文一个字节都没下发，同样可以重试。
 	// 注意必须先关掉首次响应体，否则连接无法归还连接池。
-	if plan.enabled && !st.failedOver && isFailoverStatus(resp.StatusCode) {
+	if !st.failedOver && plan.shouldRetry(resp.StatusCode) {
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st); ok {
 			resp.Body.Close()
 			cancel()
 			resp, cancel = r2, c2
-			st.failedOver, st.upstreamModel, st.matchKind =
-				true, plan.model, mapping.MatchFallback
+			st.applyPlan(plan)
 			obs.Add(ctx, g.o.Metrics.Failover, 1, st.metricAttrs("failover", resp.StatusCode))
 		}
 	}
@@ -298,6 +306,10 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 		st.upstreamModel = pub
 	}
 
+	// 能力识别与文档前置路由。放在模型选定之后：前置路由要覆盖的正是
+	// 上一步选出的模型。
+	g.applyCapabilities(r, st, *body)
+
 	if st.upstreamModel == pub {
 		return 0
 	}
@@ -308,6 +320,45 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 	}
 	*body = nb
 	return 0
+}
+
+// applyCapabilities 识别请求用到的能力，并处理文档理解的前置路由。
+//
+// 绝大多数能力走「先撞错再切」：上游明确报错才说明当前模型确实不支持，
+// 这样不会为了假设中的不支持而牺牲主力模型的效果。
+//
+// 文档理解是唯一的例外 —— 请求体一旦携带 file_id，直接改走文档模型：
+//  1. file_id 由上游的文件服务颁发，绑定在特定模型/服务上，
+//     发给不支持的模型往往得到 "file not found" 这类误导性错误，
+//     无法与真正的文件不存在区分开；
+//  2. 文件请求体积大，撞一次错的成本（上传 + 等待 + 重发）远高于普通请求。
+func (g *Gateway) applyCapabilities(r *http.Request, st *state, body []byte) {
+	cm := g.resolveCapMap(r)
+	want := cm.Want()
+	if want == 0 {
+		return
+	}
+	st.caps = capability.Detect(body, want)
+	if st.caps.Empty() {
+		return
+	}
+	// 文档理解前置路由：命中即改写，不等上游报错。
+	if st.caps.Has(capability.File) {
+		if m, ok := cm.Lookup(capability.File); ok && m != st.upstreamModel {
+			st.upstreamModel = m
+			st.capUsed = capability.File
+		}
+	}
+}
+
+// resolveCapMap 优先使用请求头下发的能力映射，缺失时回落到静态配置。
+func (g *Gateway) resolveCapMap(r *http.Request) *capability.Map {
+	if raw := r.Header.Get(CapHeader); raw != "" {
+		if m := g.capCache.Get(raw); !m.Empty() {
+			return m
+		}
+	}
+	return g.capStatic
 }
 
 // buildRequest 组装发往上游的请求：路径拼接、头过滤、按协议注入凭据与必需头。
@@ -405,6 +456,12 @@ func (g *Gateway) log(st *state, status int, r *http.Request) {
 	}
 	if st.stream {
 		attrs = append(attrs, slog.Int64("sse_events", st.sseEvents))
+	}
+	if !st.caps.Empty() {
+		attrs = append(attrs, slog.String("caps", st.caps.String()))
+	}
+	if st.capUsed != capability.None {
+		attrs = append(attrs, slog.String("cap_route", st.capUsed.String()))
 	}
 	// 真实上游模型仅进入内部日志，永不出现在对外响应中。
 	if g.o.LogUpstreamModel() && st.upstreamModel != "" {
