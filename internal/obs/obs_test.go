@@ -5,9 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus"
-	promexp "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/betterme/remap-service/internal/config"
 )
@@ -26,82 +25,17 @@ func TestLogfireEndpoint(t *testing.T) {
 	}
 }
 
-func TestResolveBackend(t *testing.T) {
-	t.Run("logfire", func(t *testing.T) {
-		ep, h, insecure, err := resolveBackend(config.Obs{
-			Backend: "logfire", LogfireRegion: "eu", LogfireToken: "pylf_v1_xxx",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ep != "https://logfire-eu.pydantic.dev" {
-			t.Errorf("endpoint = %q", ep)
-		}
-		// Logfire 要求裸 token，不带 Bearer 前缀
-		if h["Authorization"] != "pylf_v1_xxx" {
-			t.Errorf("Authorization = %q，Logfire 要求裸 token", h["Authorization"])
-		}
-		if insecure {
-			t.Error("Logfire 走 HTTPS，不应为 insecure")
-		}
+// Enabled=true 但 token 为空时必须报错，而不是静默降级成「什么都不上报」。
+func TestEnabledRequiresToken(t *testing.T) {
+	_, err := New(context.Background(), config.Obs{
+		Enabled: true, LogLevel: "error", LogfireRegion: "us",
 	})
-
-	t.Run("logfire 缺 token", func(t *testing.T) {
-		if _, _, _, err := resolveBackend(config.Obs{Backend: "logfire"}); err == nil {
-			t.Fatal("缺 token 应报错")
-		}
-	})
-
-	t.Run("otlp http 自动 insecure", func(t *testing.T) {
-		_, _, insecure, err := resolveBackend(config.Obs{
-			Backend: "otlp", OTLPEndpoint: "http://localhost:4318",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !insecure {
-			t.Error("http:// 端点应自动判定为 insecure")
-		}
-	})
-
-	t.Run("otlp https 不 insecure", func(t *testing.T) {
-		_, _, insecure, err := resolveBackend(config.Obs{
-			Backend: "otlp", OTLPEndpoint: "https://otlp.example.com",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if insecure {
-			t.Error("https:// 端点不应为 insecure")
-		}
-	})
-
-	t.Run("otlp 自定义头", func(t *testing.T) {
-		_, h, _, err := resolveBackend(config.Obs{
-			Backend:      "otlp",
-			OTLPEndpoint: "https://otlp.example.com",
-			OTLPHeaders:  map[string]string{"X-Token": "abc"},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if h["X-Token"] != "abc" {
-			t.Errorf("自定义头未透传: %v", h)
-		}
-	})
-
-	t.Run("none", func(t *testing.T) {
-		ep, _, _, err := resolveBackend(config.Obs{Backend: "none"})
-		if err != nil || ep != "" {
-			t.Errorf("none 应返回空 endpoint，got %q %v", ep, err)
-		}
-	})
-
-	t.Run("未知 backend", func(t *testing.T) {
-		if _, _, _, err := resolveBackend(config.Obs{Backend: "datadog"}); err == nil {
-			t.Fatal("未知 backend 应报错")
-		}
-	})
+	if err == nil {
+		t.Fatal("缺 LOGFIRE_TOKEN 应报错")
+	}
+	if !strings.Contains(err.Error(), "LOGFIRE_TOKEN") {
+		t.Errorf("错误信息应点明缺少的配置项，实际: %v", err)
+	}
 }
 
 // 关闭可观测性时必须完全退化为 no-op，且所有调用都安全。
@@ -124,7 +58,6 @@ func TestDisabledIsNoop(t *testing.T) {
 	Add(ctx, p.Metrics.Requests, 1, Attrs("/v1/chat", "m", "ok", 200))
 	Record(ctx, p.Metrics.Duration, 1.5, Attrs("/v1/chat", "m", "ok", 200))
 	AddUpDown(ctx, p.Metrics.InFlight, 1)
-	p.StartPrometheus(":0") // registry 为 nil，应静默跳过
 	p.Shutdown(context.Background())
 }
 
@@ -156,15 +89,10 @@ func TestMetricsNoopUsable(t *testing.T) {
 	}
 }
 
-// 指标标签必须保持低基数，且绝不能包含上游真实模型名。
+// 指标标签必须保持低基数：恰好 4 个维度，且 model 只放客户端请求的名字。
 func TestAttrsLowCardinality(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	pe, err := promexp.New(promexp.WithRegisterer(reg),
-		promexp.WithoutScopeInfo(), promexp.WithoutTargetInfo())
-	if err != nil {
-		t.Fatal(err)
-	}
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(pe))
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	defer mp.Shutdown(context.Background())
 
 	m, err := newMetrics(mp.Meter("test"))
@@ -173,23 +101,30 @@ func TestAttrsLowCardinality(t *testing.T) {
 	}
 	Add(context.Background(), m.Requests, 1, Attrs("/v1/chat/completions", "deepseek-pro", "ok", 200))
 
-	mfs, err := reg.Gather()
-	if err != nil {
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatal(err)
 	}
+
 	var labels []string
-	for _, mf := range mfs {
-		if !strings.HasPrefix(mf.GetName(), "gateway_requests") {
-			continue
-		}
-		for _, mm := range mf.GetMetric() {
-			for _, l := range mm.GetLabel() {
-				labels = append(labels, l.GetName()+"="+l.GetValue())
+	for _, sm := range rm.ScopeMetrics {
+		for _, mt := range sm.Metrics {
+			if !strings.HasPrefix(mt.Name, "gateway.requests") {
+				continue
+			}
+			sum, ok := mt.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("gateway.requests 类型 = %T，期望 Sum[int64]", mt.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				for _, kv := range dp.Attributes.ToSlice() {
+					labels = append(labels, string(kv.Key)+"="+kv.Value.Emit())
+				}
 			}
 		}
 	}
 	if len(labels) == 0 {
-		t.Fatal("未采集到 gateway_requests 指标")
+		t.Fatal("未采集到 gateway.requests 指标")
 	}
 	joined := strings.Join(labels, ",")
 	for _, want := range []string{

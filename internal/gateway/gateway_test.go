@@ -942,7 +942,7 @@ func BenchmarkStreamProxy(b *testing.B) {
 // --- 指标标签基数控制 ---
 
 // model 标签必须只收录「运维声明过」的模型名。
-// 否则客户端每次填一个新 model 名就能让 Prometheus 时间序列无限增长。
+// 否则客户端每次填一个新 model 名就能让指标时间序列无限增长。
 func TestMetricModelCardinalityBounded(t *testing.T) {
 	cfg := testConfig("http://127.0.0.1:1")
 	cfg.Mapping.Models = map[string][]string{"declared-model": {"up-v3"}}

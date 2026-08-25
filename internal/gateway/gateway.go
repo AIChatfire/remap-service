@@ -116,7 +116,7 @@ type state struct {
 // modelOther 是未声明模型在指标里的归一值。
 //
 // model 标签的取值必须来自「运维声明过的有限集合」，否则客户端只要每次
-// 填一个新的 model 名，就能让 Prometheus 的时间序列数无限增长
+// 填一个新的 model 名，就能让指标的时间序列数无限增长
 // （实测 60 个随机名产生 60 条序列）。声明之外的一律归到这里。
 const modelOther = "other"
 

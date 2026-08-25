@@ -77,8 +77,6 @@ func run(envFile string, checkOnly bool) error {
 		defer cancel()
 		o.Shutdown(sctx)
 	}()
-	o.StartPrometheus(cfg.Obs.MetricsAddr)
-
 	tr := upstream.NewTransport(cfg.Limits.MaxConns)
 	defer tr.CloseIdleConnections()
 

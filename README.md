@@ -72,7 +72,7 @@ cp .env.example .env && docker compose up -d
 容器默认只绑 `127.0.0.1`，端口冲突时用变量改，无需动 compose 文件：
 
 ```bash
-PORT=18080 METRICS_PORT=19090 docker compose up -d
+PORT=18080 docker compose up -d
 BIND_ADDR=0.0.0.0 docker compose up -d      # 确认前面有反代/安全组再这么做
 ```
 
@@ -362,7 +362,7 @@ SANITIZE_DROP_HEADERS=X-Tt-Logid,X-Client-Request-Id
 几条刻意的简化：
 
 - **无准入鉴权** —— 没有 `GATEWAY_KEYS`，凭据直接透传。
-- **`OBS_BACKEND` 可省略** —— 给了 `LOGFIRE_TOKEN` 自动用 Logfire，给了 `OTEL_EXPORTER_OTLP_ENDPOINT` 自动用 OTLP。
+- **可观测性出口只有 Logfire** —— 无后端选择项，`OBS_ENABLED` 由 `LOGFIRE_TOKEN` 推导。
 - **连接池只有 `MAX_CONNS`** —— 其余参数按比例推导。
 - **认证方式不配** —— 由协议决定。
 
@@ -395,18 +395,21 @@ curl -s localhost:8080/readyz
 
 ## 可观测性
 
-一个开关控制全部。关闭时 trace 走 OTel 空实现、指标写入丢弃型 provider，热路径无额外分配。
+出口只有 Pydantic Logfire 一个，trace 与 metrics 都走它的 OTLP/HTTP 端点
+（裸 token，不带 `Bearer` 前缀）。本机不暴露任何指标端口。
 
 ```bash
-OBS_ENABLED=true
-LOGFIRE_TOKEN=pylf_v1_xxx      # 填了它 backend 自动变 logfire
-LOGFIRE_REGION=us              # us | eu
-METRICS_ADDR=:9090             # Prometheus，独立端口；留空则不启用
+LOGFIRE_TOKEN=pylf_v1_xxx      # 填了它就自动启用
+LOGFIRE_REGION=us              # us | eu，须与 token 所属区域一致
 ```
 
-- **logfire** — Pydantic Logfire，OTLP/HTTP + 裸 token（不带 `Bearer` 前缀）。
-- **otlp** — 任意 OTLP/HTTP 后端：Jaeger、Tempo、SigNoz、阿里云 ARMS、腾讯云 APM。
-- **none** — 不外发，仅保留本地 Prometheus 与结构化日志。
+`OBS_ENABLED` 由 token 推导，不必显式配。有 token 但想临时静默上报时，
+显式设 `OBS_ENABLED=false` 即可，无需删掉 token。关闭后 trace 走 OTel 空实现、
+指标写入丢弃型 provider，热路径无额外分配，只剩结构化日志。
+
+`LOGFIRE_REGION` 只校验取值是否为 `us|eu`，不校验它与 token 是否同区。
+两者不一致时启动能过，但数据会被 Logfire 侧拒收 —— 若控制台长期无数据，
+先核对这一项。反向的 `OBS_ENABLED=true` 但缺 token 是硬错误，启动即拦。
 
 高 QPS 下建议 `OBS_SAMPLE_RATIO=0.05`，指标不受采样影响。
 
@@ -428,8 +431,8 @@ gateway_model_failover_total
 的模型名才会成为独立的时间序列，其余一律归到 `model="other"`。
 
 这一条是必需的而非优化 —— `model` 取自客户端请求体，若直接做标签，客户端只要每次
-填一个新名字就能让 Prometheus 的时间序列无限增长。实测修复前 60 个随机模型名产生
-60 条序列，修复后收敛为 2 条（1 条已声明 + 1 条 `other`）。
+填一个新名字就能让时间序列无限增长，代价直接落在 Logfire 的计费与查询性能上。
+实测修复前 60 个随机模型名产生 60 条序列，修复后收敛为 2 条（1 条已声明 + 1 条 `other`）。
 
 通配命中**不算**已声明：`*` 能匹配无穷多个名字，若把它也算进去，配一条 catch-all
 就等于放开了基数限制。排障需要原始模型名时看日志的 `model` 字段，那里是完整值。
@@ -545,39 +548,31 @@ internal/obs        日志、trace、指标（可一键关闭）
 当前形态下配置是不可变的：`.env` 进 Git，改配置走发布流程，天然有 review 和
 回滚能力。这个性质值得保留。
 
-**看板不需要网关提供。** 指标已经以 Prometheus 格式暴露在 `METRICS_ADDR`，
-trace 走 OTLP。Grafana 导入即可，而且能和其他服务的指标放在同一个视图里：
+**看板不需要网关提供。** trace 和指标都已推到 Logfire，直接在它的控制台建图，
+也能和其他服务放在同一视图里。以下查询按指标名书写，落到 Logfire 的
+SQL 面板时把指标名当列名用即可：
 
-```promql
+```text
 # 各对外模型的 QPS
-sum by (model) (rate(gateway_requests_total[1m]))
+sum by (model) of rate(gateway_requests_total, 1m)
 
 # 上游首字节 P95
-histogram_quantile(0.95, sum by (le, model) (rate(gateway_upstream_ttfb_milliseconds_bucket[5m])))
+p95(gateway_upstream_ttfb_milliseconds) by model
 
 # 过载：被闸门拒绝的比例
-sum(rate(gateway_requests_rejected_total[1m])) / sum(rate(gateway_requests_total[1m]))
+rate(gateway_requests_rejected_total) / rate(gateway_requests_total)
 
 # 故障切换频率（首选上游在报错，客户端可能无感）
-sum by (model) (rate(gateway_model_failover_total[5m]))
+sum by (model) of rate(gateway_model_failover_total, 5m)
 
 # 在途请求接近上限
 gateway_requests_inflight
 ```
 
-本地想直接看效果，compose 带了一个可选栈（Prometheus + Grafana，数据源已预置）：
+指标是懒注册的 —— 网关刚启动、还没收到过请求时 Logfire 里查不到任何序列，
+这是正常的，发一次请求即出现。上报周期为 15s，最新数据存在一个采集窗口的延迟。
 
-```bash
-docker compose --profile observability up -d
-# Grafana http://127.0.0.1:3000 （admin/admin）
-# Prometheus http://127.0.0.1:9091
-```
-
-**前提是 `.env` 里 `OBS_ENABLED=true`。** 关闭时 registry 为 nil，`/metrics`
-端点根本不会监听，抓取会一直 target down。另外指标是懒注册的 ——
-网关刚启动、还没收到过请求时 `/metrics` 返回 200 但内容为空，这是正常的。
-
-如果确实需要一个页面，建议的边界是**只读**：读 `/readyz` 与 `/metrics` 渲染状态，
+如果确实需要一个自建页面，建议的边界是**只读**：读 `/readyz` 渲染健康状态，
 不提供写入。这样网关仍然无状态，页面挂了也不影响转发。
 
 真正需要「界面上改模型映射」的场景，通常意味着上游应该是 NewAPI 这类带管理后台的

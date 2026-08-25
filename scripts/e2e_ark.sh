@@ -46,8 +46,6 @@ UPSTREAM_FIRST_BYTE_TIMEOUT=60s
 SANITIZE_ALIASES=${ARK_MODEL}=deepseek-v4-flash|DeepSeek-V4-Flash
 SANITIZE_REPLACE=ark.cn-beijing.volces.com=api.internal.local;volces=internal
 SANITIZE_DROP_HEADERS=X-Tt-Logid,X-Client-Request-Id
-OBS_ENABLED=true
-METRICS_ADDR=127.0.0.1:19099
 EOF
 
 ./bin/gateway -env "$ENVFILE" >/tmp/ark_gw.log 2>&1 &
@@ -198,11 +196,6 @@ print(("  \033[32m✓\033[0m " if good else "  \033[31m✗\033[0m ")
       +f'加权分流 2:1 生效 —— A={a} B={b} 实测 {r:.2f}:1 (n={a+b}，抽样)')
 PY
 
-# 抓一份「此刻为止全部请求都带映射」的指标快照，供用例 8 做泄漏断言。
-# 必须在下面的「未声明映射透传」之前抓：那个用例客户端自己就填了上游模型名，
-# 指标标签随之等于上游模型，属于预期行为而非泄漏。
-METRICS_MAPPED=$("${CURL[@]}" "http://127.0.0.1:19099/metrics")
-
 # 多对一：两个对外模型共用同一上游，各自按请求维度脱敏
 for pub in alpha beta; do
   "${CURL[@]}" -o /tmp/ark_m2o.json "$GW/v1/chat/completions" \
@@ -279,19 +272,10 @@ else
 fi
 
 # ============================================================
-echo "【用例 8】指标与日志"
+echo "【用例 8】日志"
 # ============================================================
-MET=$("${CURL[@]}" "http://127.0.0.1:19099/metrics")
-grep -qE "gateway_requests_total.*model=\"${PUB_MODEL}\"" <<<"$MET" &&
-  ok "指标标签使用对外模型名" || bad "指标缺少对外模型标签"
-grep -qE "gateway_sse_events_total" <<<"$MET" && ok "SSE 事件计数已采集" || bad "缺少 SSE 指标"
-
-# 泄漏断言只针对「有映射」的流量快照。用例 5 里的透传请求由客户端直接
-# 填写上游模型名，此时 model 标签等于该名称属于预期语义，不算泄漏。
-grep -q "$ARK_MODEL" <<<"$METRICS_MAPPED" &&
-  bad "有映射的请求在指标中泄漏上游模型" ||
-  ok "有映射流量的指标标签无上游模型泄漏"
-
+# 指标已全部外发到 Logfire，本机不再有 /metrics 可断言。
+# model 标签的基数与脱敏语义由单测 TestMetricModelCardinalityBounded 覆盖。
 grep -q "\"upstream_model\":\"$ARK_MODEL\"" /tmp/ark_gw.log &&
   ok "内部日志保留真实上游模型（审计可用）" || bad "内部日志缺少审计字段"
 grep -q "\"model\":\"${PUB_MODEL}\"" /tmp/ark_gw.log &&

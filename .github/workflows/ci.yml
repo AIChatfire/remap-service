@@ -179,4 +179,3 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config -q
-          docker compose --profile observability config -q

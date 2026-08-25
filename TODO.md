@@ -10,7 +10,7 @@
       改为「无锁快照 + 分片回填」两层，最坏情况降到 716 ns/769 B（改善 230 倍），
       稳态 18 ns。测试：`TestForHighCardinalityBounded`、`TestForPromotesToHotSnapshot`。
 - [x] **指标标签基数爆炸** —— `model` 标签直接取客户端请求值，实测 60 个随机
-      model 名产生 60 条 Prometheus 时间序列。改为只有**精确声明**过的模型名
+      model 名产生 60 条独立时间序列。改为只有**精确声明**过的模型名
       进标签，其余归一为 `other`（通配命中不算已声明，否则 catch-all 等于放开限制）。
       实测 60 条收敛为 2 条。测试：`TestMetricModelCardinalityBounded`。
 
@@ -37,7 +37,7 @@
       唯一需要改代码的情况：新能力落在新路径前缀**且**响应把模型名放在了新字段
       路径，此时补 `Spec.ModelPaths` / `IDPaths`（README 附了定位脚本）。
 - **不做管理页面** —— 会引入配置的第二份真相，把无状态进程变成有状态服务。
-      看板用 Grafana 消费已有的 Prometheus 指标（README 附了 PromQL）。
+      看板直接在 Logfire 控制台建（README 附了常用查询）。
       需要界面改映射的场景应由上游 NewAPI 这类带后台的服务下发 `X-Model-Map`。
 
 ### 验收

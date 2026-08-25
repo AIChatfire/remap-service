@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -91,6 +92,10 @@ type Limits struct {
 }
 
 // Obs 控制可观测性，由 Enabled 一键开关。
+//
+// 后端只有 Pydantic Logfire 一个：trace 与 metrics 都走它的 OTLP/HTTP 端点。
+// 网关不再自带 Prometheus 端点，也不再支持通用 OTLP —— 少一个后端选项，
+// 就少一整套「配了却没生效」的排查路径。
 type Obs struct {
 	Enabled     bool
 	ServiceName string
@@ -98,13 +103,8 @@ type Obs struct {
 	Version     string
 	SampleRatio float64
 
-	Backend       string // logfire | otlp | none
 	LogfireToken  string
 	LogfireRegion string
-	OTLPEndpoint  string
-	OTLPHeaders   map[string]string
-
-	MetricsAddr string
 
 	LogLevel         string
 	LogFormat        string
@@ -154,19 +154,15 @@ func Load(envFile string) (*Config, error) {
 			ServiceName:      envStr("OBS_SERVICE_NAME", "remap-gateway"),
 			Env:              envStr("OBS_ENV", "default"),
 			SampleRatio:      envFloat("OBS_SAMPLE_RATIO", 1.0),
-			Backend:          strings.ToLower(envStr("OBS_BACKEND", "")),
 			LogfireToken:     envStr("LOGFIRE_TOKEN", ""),
-			LogfireRegion:    envStr("LOGFIRE_REGION", "us"),
-			OTLPEndpoint:     strings.TrimRight(envStr("OTEL_EXPORTER_OTLP_ENDPOINT", ""), "/"),
-			OTLPHeaders:      envMap("OTEL_EXPORTER_OTLP_HEADERS"),
-			MetricsAddr:      envStr("METRICS_ADDR", ":9090"),
+			LogfireRegion:    strings.ToLower(envStr("LOGFIRE_REGION", "us")),
 			LogLevel:         envStr("LOG_LEVEL", "info"),
 			LogFormat:        envStr("LOG_FORMAT", "json"),
 			LogUpstreamModel: envBool("LOG_UPSTREAM_MODEL", true),
 		},
 	}
 
-	c.inferBackend()
+	c.normalizeObs()
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -188,17 +184,16 @@ func loadProtocolBases() map[string]string {
 	return out
 }
 
-// inferBackend 补全可观测性后端：给了凭据却忘了指定 backend 是最常见的失误。
-func (c *Config) inferBackend() {
-	if c.Obs.Backend == "" {
-		switch {
-		case c.Obs.LogfireToken != "":
-			c.Obs.Backend = "logfire"
-		case c.Obs.OTLPEndpoint != "":
-			c.Obs.Backend = "otlp"
-		default:
-			c.Obs.Backend = "none"
-		}
+// normalizeObs 补全可观测性的隐含默认值。
+//
+// 只给 LOGFIRE_TOKEN、忘了 OBS_ENABLED=true 是最常见的失误，直接视为要开。
+// 但显式写了 OBS_ENABLED=false 必须被尊重——临时静默上报不该要求先删掉 token。
+// 判据是「值非空」而非 LookupEnv：空值等同未配置，与 envBool 的口径保持一致，
+// 否则 .env 里一行 `OBS_ENABLED=` 就会静悄悄压掉自动启用。
+// 反向不成立：Enabled=true 但没 token 是硬错误，交给 Validate 拦。
+func (c *Config) normalizeObs() {
+	if os.Getenv("OBS_ENABLED") == "" && c.Obs.LogfireToken != "" {
+		c.Obs.Enabled = true
 	}
 	if c.Obs.LogfireRegion == "" {
 		c.Obs.LogfireRegion = "us"
@@ -224,18 +219,13 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	switch c.Obs.Backend {
-	case "logfire":
-		if c.Obs.Enabled && c.Obs.LogfireToken == "" {
-			errs = append(errs, errors.New("OBS_BACKEND=logfire 时必须提供 LOGFIRE_TOKEN"))
+	if c.Obs.Enabled {
+		if c.Obs.LogfireToken == "" {
+			errs = append(errs, errors.New("OBS_ENABLED=true 时必须提供 LOGFIRE_TOKEN"))
 		}
-	case "otlp":
-		if c.Obs.Enabled && c.Obs.OTLPEndpoint == "" {
-			errs = append(errs, errors.New("OBS_BACKEND=otlp 时必须提供 OTEL_EXPORTER_OTLP_ENDPOINT"))
+		if c.Obs.LogfireRegion != "us" && c.Obs.LogfireRegion != "eu" {
+			errs = append(errs, fmt.Errorf("LOGFIRE_REGION 只能是 us|eu，当前 %q", c.Obs.LogfireRegion))
 		}
-	case "none":
-	default:
-		errs = append(errs, fmt.Errorf("OBS_BACKEND 只能是 logfire|otlp|none，当前 %q", c.Obs.Backend))
 	}
 
 	return errors.Join(errs...)

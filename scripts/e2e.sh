@@ -66,7 +66,6 @@ UPSTREAM_BASE=http://127.0.0.1:${UP_PORT}
 SANITIZE_ALIASES=deepseek-v3=deepseek-v3-250101|DeepSeek-V3
 SANITIZE_DROP_HEADERS=X-Upstream-Instance
 LOG_LEVEL=warn
-METRICS_ADDR=
 EOF
 
 ./bin/gateway -env "$ENVFILE" >/tmp/e2e_gw.log 2>&1 &

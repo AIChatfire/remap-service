@@ -1,9 +1,10 @@
 # LLM 模型映射网关 —— 本地与单机部署编排
 #
-#   cp .env.example .env && docker compose up -d          # 只起网关
-#   docker compose --profile observability up -d          # 加 Prometheus + Grafana
+#   cp .env.example .env && docker compose up -d
 #
 # 全部配置来自 .env —— compose 会自动加载同目录的 .env 并注入容器。
+# 遥测只有 Logfire 一条出口：.env 里给 LOGFIRE_TOKEN 即自动开启，
+# trace 与 metrics 都直接外发，本机不再暴露指标端口、不再需要本地存储卷。
 
 name: remap
 
@@ -27,7 +28,6 @@ services:
       # 默认只绑本机。公网暴露前请确认已有反代或安全组兜底 ——
       # 网关自身没有准入鉴权，任何能连上的客户端都能通过它转发。
       - "${BIND_ADDR:-127.0.0.1}:${PORT:-8080}:8080"       # 网关入口
-      - "${BIND_ADDR:-127.0.0.1}:${METRICS_PORT:-9090}:9090" # Prometheus 指标
     env_file:
       - .env
     healthcheck:
@@ -54,54 +54,6 @@ services:
           memory: 128M
     networks:
       - remap
-
-  # ---------- 可选：可观测性栈 ----------
-  # 需要网关侧同时开启指标：.env 里设 OBS_ENABLED=true、METRICS_ADDR=:9090。
-  # OBS_ENABLED=false 时 registry 为 nil，/metrics 端点根本不会监听，抓取会一直失败。
-  prometheus:
-    image: prom/prometheus:v3.1.0
-    profiles: ["observability"]
-    restart: unless-stopped
-    ports:
-      # 默认 9091：9090 已被网关的指标端点占用。
-      - "${BIND_ADDR:-127.0.0.1}:${PROMETHEUS_PORT:-9091}:9090"
-    volumes:
-      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=15d
-      - --web.enable-lifecycle
-    logging: *default-logging
-    depends_on:
-      - gateway
-    networks:
-      - remap
-
-  grafana:
-    image: grafana/grafana:11.5.1
-    profiles: ["observability"]
-    restart: unless-stopped
-    ports:
-      - "${BIND_ADDR:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
-    environment:
-      # 仅供本地排查，默认只绑 127.0.0.1。若要对外暴露，务必换掉这个密码。
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
-    volumes:
-      - ./deploy/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
-      - grafana-data:/var/lib/grafana
-    logging: *default-logging
-    depends_on:
-      - prometheus
-    networks:
-      - remap
-
-volumes:
-  prometheus-data:
-  grafana-data:
 
 networks:
   remap:

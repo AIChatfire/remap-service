@@ -17,10 +17,9 @@ var allEnvKeys = []string{
 	"SANITIZE_OFF", "SANITIZE_ALIASES", "SANITIZE_REPLACE",
 	"SANITIZE_DROP_HEADERS", "SANITIZE_MAX_VALUE_LEN",
 	"MAX_CONNS", "MAX_BODY_BYTES", "MAX_SANITIZE_BYTES",
-	"OBS_ENABLED", "OBS_BACKEND", "OBS_SERVICE_NAME", "OBS_ENV", "OBS_SAMPLE_RATIO",
+	"OBS_ENABLED", "OBS_SERVICE_NAME", "OBS_ENV", "OBS_SAMPLE_RATIO",
 	"LOGFIRE_TOKEN", "LOGFIRE_REGION",
-	"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS",
-	"METRICS_ADDR", "LOG_LEVEL", "LOG_FORMAT", "LOG_UPSTREAM_MODEL",
+	"LOG_LEVEL", "LOG_FORMAT", "LOG_UPSTREAM_MODEL",
 }
 
 func isolate(t *testing.T) {
@@ -128,8 +127,11 @@ func TestDefaults(t *testing.T) {
 	if !c.Obs.LogUpstreamModel {
 		t.Error("内部日志记录上游模型应默认开启")
 	}
-	if c.Obs.Backend != "none" {
-		t.Errorf("无凭据时 backend 应为 none，实际 %q", c.Obs.Backend)
+	if c.Obs.Enabled {
+		t.Error("无 LOGFIRE_TOKEN 时可观测性应保持关闭")
+	}
+	if c.Obs.LogfireRegion != "us" {
+		t.Errorf("LOGFIRE_REGION 默认应为 us，实际 %q", c.Obs.LogfireRegion)
 	}
 }
 
@@ -317,48 +319,58 @@ MAX_BODY_BYTES=32MB
 	}
 }
 
-// 给了凭据却忘改 backend 是最常见失误，应自动推导。
-func TestBackendInferred(t *testing.T) {
-	t.Run("logfire", func(t *testing.T) {
+// 给了 token 却忘开 OBS_ENABLED 是最常见失误，应自动启用。
+func TestObsEnabledInferred(t *testing.T) {
+	t.Run("有 token 自动启用", func(t *testing.T) {
 		isolate(t)
 		t.Setenv("UPSTREAM_BASE", "https://x.com")
-		t.Setenv("OBS_ENABLED", "1")
 		t.Setenv("LOGFIRE_TOKEN", "pylf_v1_xxx")
 		c, err := Load("")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if c.Obs.Backend != "logfire" {
-			t.Errorf("backend = %q", c.Obs.Backend)
+		if !c.Obs.Enabled {
+			t.Error("有 LOGFIRE_TOKEN 时应自动启用")
 		}
 	})
 
-	t.Run("otlp", func(t *testing.T) {
+	t.Run("无 token 保持关闭", func(t *testing.T) {
 		isolate(t)
 		t.Setenv("UPSTREAM_BASE", "https://x.com")
-		t.Setenv("OBS_ENABLED", "1")
-		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
 		c, err := Load("")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if c.Obs.Backend != "otlp" {
-			t.Errorf("backend = %q", c.Obs.Backend)
+		if c.Obs.Enabled {
+			t.Error("无 token 时应保持关闭")
 		}
 	})
 
-	t.Run("显式指定不被覆盖", func(t *testing.T) {
+	t.Run("显式关闭不被覆盖", func(t *testing.T) {
 		isolate(t)
 		t.Setenv("UPSTREAM_BASE", "https://x.com")
-		t.Setenv("OBS_BACKEND", "otlp")
-		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
-		t.Setenv("LOGFIRE_TOKEN", "pylf_xxx")
+		t.Setenv("OBS_ENABLED", "false")
+		t.Setenv("LOGFIRE_TOKEN", "pylf_v1_xxx")
 		c, err := Load("")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if c.Obs.Backend != "otlp" {
-			t.Errorf("backend = %q", c.Obs.Backend)
+		if c.Obs.Enabled {
+			t.Error("OBS_ENABLED=false 应压制自动启用")
+		}
+	})
+
+	t.Run("region 归一化", func(t *testing.T) {
+		isolate(t)
+		t.Setenv("UPSTREAM_BASE", "https://x.com")
+		t.Setenv("LOGFIRE_TOKEN", "pylf_v1_xxx")
+		t.Setenv("LOGFIRE_REGION", "EU")
+		c, err := Load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Obs.LogfireRegion != "eu" {
+			t.Errorf("region = %q，应归一化为小写 eu", c.Obs.LogfireRegion)
 		}
 	})
 }
@@ -373,15 +385,13 @@ func TestValidate(t *testing.T) {
 		{"协议覆盖非法", map[string]string{
 			"UPSTREAM_BASE": "https://x.com", "UPSTREAM_BASE_ANTHROPIC": "ftp://y.com",
 		}, "UPSTREAM_BASE_ANTHROPIC 必须以 http"},
-		{"logfire 缺 token", map[string]string{
-			"UPSTREAM_BASE": "https://x.com", "OBS_ENABLED": "1", "OBS_BACKEND": "logfire",
+		{"启用却缺 token", map[string]string{
+			"UPSTREAM_BASE": "https://x.com", "OBS_ENABLED": "1",
 		}, "LOGFIRE_TOKEN"},
-		{"otlp 缺 endpoint", map[string]string{
-			"UPSTREAM_BASE": "https://x.com", "OBS_ENABLED": "1", "OBS_BACKEND": "otlp",
-		}, "OTEL_EXPORTER_OTLP_ENDPOINT"},
-		{"未知 backend", map[string]string{
-			"UPSTREAM_BASE": "https://x.com", "OBS_BACKEND": "datadog",
-		}, "OBS_BACKEND 只能是"},
+		{"非法 region", map[string]string{
+			"UPSTREAM_BASE": "https://x.com", "LOGFIRE_TOKEN": "pylf_v1_xxx",
+			"LOGFIRE_REGION": "ap",
+		}, "LOGFIRE_REGION 只能是"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

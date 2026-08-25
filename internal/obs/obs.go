@@ -1,10 +1,8 @@
 // Package obs 提供可一键开关的可观测性设施：结构化日志、分布式 trace、指标。
 //
-// 后端由 observability.backend 决定：
-//
-//	logfire  -> Pydantic Logfire（OTLP/HTTP + 裸 token）
-//	otlp     -> 任意 OTLP/HTTP 后端（Jaeger / Tempo / SigNoz / 云厂商）
-//	none     -> 不外发，仅保留本地 Prometheus 与日志
+// 后端只有一个：Pydantic Logfire，走 OTLP/HTTP + 裸 token，trace 与 metrics
+// 都推给它。网关不自带 Prometheus 端点 —— 单一出口意味着「配了没生效」只有
+// 一条排查路径：token 对不对、进程有没有把 Enabled 打开。
 //
 // observability.enabled=false 时全部退化为 no-op：
 // trace 使用 OTel 空实现，指标写入丢弃型 provider，热路径无额外分配。
@@ -14,18 +12,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
-	promexp "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -46,8 +40,6 @@ type Provider struct {
 	enabled     bool
 	logUpstream bool
 	shutdowns   []func(context.Context) error
-	promServer  *http.Server
-	registry    *prometheus.Registry
 }
 
 // Enabled 报告可观测性总开关状态。
@@ -83,42 +75,40 @@ func New(ctx context.Context, c config.Obs) (*Provider, error) {
 		return p, fmt.Errorf("build otel resource: %w", err)
 	}
 
-	endpoint, headers, insecure, err := resolveBackend(c)
-	if err != nil {
-		return p, err
+	// Enabled 为真时 token 必定非空（config.Validate 已拦），这里只做兜底。
+	if c.LogfireToken == "" {
+		return p, fmt.Errorf("LOGFIRE_TOKEN 为空，无法启用可观测性")
+	}
+	endpoint := logfireEndpoint(c.LogfireRegion)
+	headers := map[string]string{
+		"Authorization": c.LogfireToken, // Logfire 要求裸 token，不带 Bearer 前缀
 	}
 
-	if endpoint != "" {
-		if err := p.initTraces(ctx, res, endpoint, headers, insecure, c.SampleRatio); err != nil {
-			return p, err
-		}
+	if err := p.initTraces(ctx, res, endpoint, headers, c.SampleRatio); err != nil {
+		return p, err
 	}
-	if err := p.initMetrics(ctx, res, endpoint, headers, insecure, c.MetricsAddr != ""); err != nil {
+	if err := p.initMetrics(ctx, res, endpoint, headers); err != nil {
 		return p, err
 	}
 
 	p.Logger.Info("可观测性已启用",
-		slog.String("backend", c.Backend),
-		slog.Bool("otlp", endpoint != ""),
-		slog.Bool("prometheus", c.MetricsAddr != ""),
+		slog.String("backend", "logfire"),
+		slog.String("region", c.LogfireRegion),
+		slog.String("endpoint", endpoint),
 	)
 	return p, nil
 }
 
 func (p *Provider) initTraces(
 	ctx context.Context, res *resource.Resource,
-	endpoint string, headers map[string]string, insecure bool, ratio float64,
+	endpoint string, headers map[string]string, ratio float64,
 ) error {
-	opts := []otlptracehttp.Option{
-		otlptracehttp.WithEndpointURL(endpoint + "/v1/traces"),
+	exp, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpointURL(endpoint+"/v1/traces"),
 		otlptracehttp.WithHeaders(headers),
 		otlptracehttp.WithCompression(otlptracehttp.GzipCompression),
-		otlptracehttp.WithTimeout(10 * time.Second),
-	}
-	if insecure {
-		opts = append(opts, otlptracehttp.WithInsecure())
-	}
-	exp, err := otlptracehttp.New(ctx, opts...)
+		otlptracehttp.WithTimeout(10*time.Second),
+	)
 	if err != nil {
 		return fmt.Errorf("otlp trace exporter: %w", err)
 	}
@@ -142,43 +132,24 @@ func (p *Provider) initTraces(
 
 func (p *Provider) initMetrics(
 	ctx context.Context, res *resource.Resource,
-	endpoint string, headers map[string]string, insecure, wantProm bool,
+	endpoint string, headers map[string]string,
 ) error {
-	var readers []sdkmetric.Option
-
-	if wantProm {
-		reg := prometheus.NewRegistry()
-		pe, err := promexp.New(promexp.WithRegisterer(reg),
-			promexp.WithoutScopeInfo(), promexp.WithoutTargetInfo())
-		if err != nil {
-			return fmt.Errorf("prometheus exporter: %w", err)
-		}
-		readers = append(readers, sdkmetric.WithReader(pe))
-		p.registry = reg
+	exp, err := otlpmetrichttp.New(ctx,
+		otlpmetrichttp.WithEndpointURL(endpoint+"/v1/metrics"),
+		otlpmetrichttp.WithHeaders(headers),
+		otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression),
+		otlpmetrichttp.WithTimeout(10*time.Second),
+	)
+	if err != nil {
+		return fmt.Errorf("otlp metric exporter: %w", err)
 	}
-	if endpoint != "" {
-		opts := []otlpmetrichttp.Option{
-			otlpmetrichttp.WithEndpointURL(endpoint + "/v1/metrics"),
-			otlpmetrichttp.WithHeaders(headers),
-			otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression),
-			otlpmetrichttp.WithTimeout(10 * time.Second),
-		}
-		if insecure {
-			opts = append(opts, otlpmetrichttp.WithInsecure())
-		}
-		exp, err := otlpmetrichttp.New(ctx, opts...)
-		if err != nil {
-			return fmt.Errorf("otlp metric exporter: %w", err)
-		}
-		readers = append(readers, sdkmetric.WithReader(
+
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(
 			sdkmetric.NewPeriodicReader(exp, sdkmetric.WithInterval(15*time.Second)),
-		))
-	}
-	if len(readers) == 0 {
-		return nil
-	}
-
-	mp := sdkmetric.NewMeterProvider(append([]sdkmetric.Option{sdkmetric.WithResource(res)}, readers...)...)
+		),
+	)
 	otel.SetMeterProvider(mp)
 	m, err := newMetrics(mp.Meter("remap-gateway"))
 	if err != nil {
@@ -189,31 +160,8 @@ func (p *Provider) initMetrics(
 	return nil
 }
 
-// resolveBackend 返回 OTLP 基地址、附加头与是否明文。endpoint 为空表示不外发。
-func resolveBackend(c config.Obs) (endpoint string, headers map[string]string, insecure bool, err error) {
-	headers = map[string]string{}
-	switch c.Backend {
-	case "logfire":
-		if c.LogfireToken == "" {
-			return "", nil, false, fmt.Errorf("logfire token 为空")
-		}
-		endpoint = logfireEndpoint(c.LogfireRegion)
-		headers["Authorization"] = c.LogfireToken // Logfire 要求裸 token，不带 Bearer
-	case "otlp":
-		endpoint = strings.TrimRight(c.OTLPEndpoint, "/")
-		for k, v := range c.OTLPHeaders {
-			headers[k] = v
-		}
-		insecure = strings.HasPrefix(endpoint, "http://")
-	case "none", "":
-		return "", headers, false, nil
-	default:
-		return "", nil, false, fmt.Errorf("未知 backend %q", c.Backend)
-	}
-	return endpoint, headers, insecure, nil
-}
-
 // logfireEndpoint 按区域推导 Logfire 的 OTLP 基地址。
+// region 已由 config 归一化并校验为 us|eu，这里对未知值保守回落到 us。
 func logfireEndpoint(region string) string {
 	if strings.EqualFold(region, "eu") {
 		return "https://logfire-eu.pydantic.dev"
@@ -221,33 +169,10 @@ func logfireEndpoint(region string) string {
 	return "https://logfire-us.pydantic.dev"
 }
 
-// StartPrometheus 在独立端口暴露 /metrics。addr 为空或未启用时为空操作。
-func (p *Provider) StartPrometheus(addr string) {
-	if p == nil || p.registry == nil || addr == "" {
-		return
-	}
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(p.registry, promhttp.HandlerOpts{
-		EnableOpenMetrics: true,
-		ErrorHandling:     promhttp.ContinueOnError,
-	}))
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	p.promServer = srv
-	go func() {
-		p.Logger.Info("Prometheus 指标端点启动", slog.String("addr", addr))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			p.Logger.Error("Prometheus 端点异常退出", slog.String("err", err.Error()))
-		}
-	}()
-}
-
 // Shutdown 优雅关闭所有导出器。
 func (p *Provider) Shutdown(ctx context.Context) {
 	if p == nil {
 		return
-	}
-	if p.promServer != nil {
-		_ = p.promServer.Shutdown(ctx)
 	}
 	for i := len(p.shutdowns) - 1; i >= 0; i-- {
 		if err := p.shutdowns[i](ctx); err != nil {
