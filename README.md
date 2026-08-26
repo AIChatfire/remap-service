@@ -368,6 +368,35 @@ SANITIZE_DROP_HEADERS=X-Tt-Logid,X-Client-Request-Id
 
 字节数支持 `64MB` / `32mb` / `1048576`，时长支持 `120s` / `2m` / `120`（纯数字按秒）。
 
+### 出网代理
+
+支持 `http` / `https` / `socks5` / `socks5h` 四种 scheme，均由标准库处理，
+无额外依赖。`socks5` 与 `socks5h` 在 Go 中行为一致：域名都由代理侧解析，
+不会在网关本地做 DNS。
+
+优先级由高到低：
+
+1. **`X-Upstream-Proxy` 请求头** —— 传完整 URL（如 `socks5://10.0.0.5:1080`）。
+   需 `UPSTREAM_PROXY_FROM_HEADER=true` 才生效，默认关闭。
+   该头是网关内部协议头，不会转发给上游。
+2. **`UPSTREAM_PROXY`** —— 全局默认出口。
+3. **`HTTP_PROXY` / `HTTPS_PROXY`** —— 以上都未配时回落到标准环境变量。
+
+`UPSTREAM_NO_PROXY` 语义同标准 `NO_PROXY`（支持 `.suffix`、CIDR、`*`），
+默认已含 `localhost,127.0.0.1,::1`，本地 mock 上游联调不会被打进代理。
+**豁免对三种来源一律生效**，包括请求头指定的代理 —— 否则 `X-Upstream-Proxy`
+会成为绕过豁免的后门。
+
+两个容易踩的点：
+
+- **超时语义变了。** `UPSTREAM_TIMEOUT` 等覆盖「网关→代理→上游」整条链路，
+  SOCKS5 握手算在其中，代理慢会让 `FIRST_BYTE_TIMEOUT` 比直连更早触发。
+- **代理 URL 里的密码不进日志。** 启动摘要只输出 scheme + host，userinfo 段被抹掉。
+
+按请求代理的连接池是**按代理 URL 分桶复用**，同一代理的请求共享一个
+transport，不会每请求新建连接。默认出口（无代理头）走独立快路径，
+查表开销 ~7 ns、零分配，见 `BenchmarkRouterDefaultPath`。
+
 ### 过载保护
 
 ```bash

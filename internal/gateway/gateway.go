@@ -101,6 +101,9 @@ type state struct {
 	caps capability.Set
 	// capUsed 非 None 时，表示本次已切到该能力的专用模型。
 	capUsed capability.Kind
+	// proxy 是本次请求实际使用的出网代理（已脱敏，仅 scheme://host）。
+	// 空串表示走默认出口。只进内部日志与 trace 属性，不进指标标签。
+	proxy string
 	// failedOver 标记本次请求是否发生了故障切换。
 	failedOver bool
 	stream     bool
@@ -147,6 +150,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		trace.WithAttributes(
 			attribute.String("http.request.method", r.Method),
 			attribute.String("url.path", r.URL.Path),
+			// 客户 IP 只作 span 属性，不作指标标签：IP 基数无上界，
+			// 一旦进 metric label 就会按客户数量线性放大时间序列。
+			attribute.String("client.address", clientIP(r, g.cfg.Obs.TrustedProxyHops)),
 		))
 	defer span.End()
 
@@ -190,6 +196,21 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 		st.outcome = "no_upstream"
 		return writeError(w, http.StatusBadGateway, "gateway_error",
 			"upstream base not configured; set UPSTREAM_BASE or send a valid "+BaseHeader+" header")
+	}
+
+	proxy, ok := g.resolveProxy(r)
+	if !ok {
+		st.outcome = "bad_proxy"
+		return writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"invalid "+ProxyHeader+" header; expected a full URL with scheme http, https, socks5 or socks5h")
+	}
+	if proxy != "" {
+		// 注入 ctx 而非改 Transport：buildRequest 与 client.Do 都派生自
+		// 这个 ctx，故障切换重试同样继承，无需在各处重复传递。
+		ctx = upstream.WithProxy(ctx, proxy)
+		// 只留 scheme://host：代理 URL 的 userinfo 段常带密码，
+		// 原文进日志等于把凭据写进日志系统。
+		st.proxy = upstream.RedactProxy(proxy)
 	}
 
 	// ---------- 2. 读取并改写请求体 ----------
@@ -469,6 +490,11 @@ func (g *Gateway) log(st *state, status int, r *http.Request) {
 	}
 	if st.capUsed != capability.None {
 		attrs = append(attrs, slog.String("cap_route", st.capUsed.String()))
+	}
+	// 已脱敏为 scheme://host。只在走了 per-request 代理时出现，
+	// 默认出口不打这个字段以免每条日志多一列常量。
+	if st.proxy != "" {
+		attrs = append(attrs, slog.String("proxy", st.proxy))
 	}
 	// 真实上游模型仅进入内部日志，永不出现在对外响应中。
 	if g.o.LogUpstreamModel() && st.upstreamModel != "" {

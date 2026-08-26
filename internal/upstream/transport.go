@@ -13,6 +13,8 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -22,14 +24,47 @@ import (
 )
 
 // NewTransport 依据连接上限构建可高度复用的 transport。
+//
+// 代理取自 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。显式配置与
+// per-request 代理由 Router 处理，见 proxy.go。
 func NewTransport(maxConns int) *http.Transport {
+	return newTransport(maxConns, http.ProxyFromEnvironment)
+}
+
+// NewRoundTripper 是给 main 用的统一入口：按配置决定默认出口，
+// 再包一层 Router 以支持 per-request 的 X-Upstream-Proxy。
+//
+// 默认出口的代理来源：UPSTREAM_PROXY 非空则固定走它，否则回落到
+// HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。
+//
+// 返回值同时满足 http.RoundTripper 与 CloseIdleConnections，
+// 可直接交给 NewClient 并在退出时清理。
+func NewRoundTripper(maxConns int, u config.Upstream) *Router {
+	proxy := http.ProxyFromEnvironment
+	if p := strings.TrimSpace(u.Proxy); p != "" {
+		// 已在 config.Validate 校验过，这里解析失败只可能是被绕过配置层，
+		// 此时宁可回落到环境变量也不要 panic。
+		if pu, err := url.Parse(p); err == nil {
+			proxy = proxyWithBypass(pu, u.NoProxy)
+		}
+	}
+	return NewRouter(newTransport(maxConns, proxy), maxConns, u.NoProxy)
+}
+
+// newTransport 构建 transport，代理策略由入参决定。
+//
+// 每个代理都要一个独立实例，不能用 Clone()：ConfigureTransports 注册的
+// TLSNextProto 处理器会捕获一个共享的 http2.Transport，而后者按 authority
+// 池化连接。Clone 出来的多个代理 transport 共享该池，会把「经代理 A 建立的
+// h2 连接」交给声明走代理 B 的请求 —— 表现为流量静默走错代理。
+func newTransport(maxConns int, proxy func(*http.Request) (*url.URL, error)) *http.Transport {
 	if maxConns <= 0 {
 		maxConns = 1024
 	}
 	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 
 	t := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxy,
 		DialContext:           d.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          maxConns * 4,

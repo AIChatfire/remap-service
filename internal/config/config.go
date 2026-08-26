@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/betterme/remap-service/internal/protocol"
+	"github.com/betterme/remap-service/internal/proxyurl"
 )
 
 // Config 是网关的完整配置，全部来自环境变量。
@@ -40,6 +41,18 @@ type Upstream struct {
 	Key string
 	// AllowBaseHeader 控制是否接受 X-Upstream-Base 覆盖上游地址。
 	AllowBaseHeader bool
+	// Proxy 是默认出网代理，支持 http / https / socks5 / socks5h，须为完整 URL。
+	// 留空时回落到 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。
+	Proxy string
+	// AllowProxyHeader 控制是否接受 X-Upstream-Proxy 覆盖本次请求的代理。
+	// 默认关闭：开启后客户端可指定任意出网地址，属于把网关当跳板的能力。
+	AllowProxyHeader bool
+	// NoProxy 是不走代理的主机列表，语义同标准 NO_PROXY。
+	//
+	// 显式配 Proxy 时走 http.ProxyURL，它没有 ProxyFromEnvironment
+	// 对 localhost 的豁免，因此默认值必须带上本机地址 ——
+	// 否则本地 mock 上游联调会被打进代理。
+	NoProxy string
 
 	Timeout          time.Duration
 	FirstByteTimeout time.Duration
@@ -117,6 +130,14 @@ type Obs struct {
 	// 命中的请求仍然正常代理，只是不记录可观测数据。
 	ExcludedURLs []string
 
+	// TrustedProxyHops 是网关前方可信反向代理的层数，决定客户 IP 从
+	// X-Forwarded-For 的哪一位取值。
+	//
+	// 默认 0 表示只信任 RemoteAddr、完全忽略 XFF —— 该头由客户端可写，
+	// 在没有可信代理剥离的前提下采纳它等于允许任意伪造来源 IP。
+	// 网关直接暴露公网时保持 0；前置 1 层 Nginx 或 CLB 时设 1，依此类推。
+	TrustedProxyHops int
+
 	// MetricInterval 是指标上报周期。
 	//
 	// 上报本身在独立 goroutine，不占请求路径；调大只减少出网次数，
@@ -136,6 +157,9 @@ func Load(envFile string) (*Config, error) {
 			Base:             strings.TrimRight(envStr("UPSTREAM_BASE", ""), "/"),
 			Key:              envStr("UPSTREAM_KEY", ""),
 			AllowBaseHeader:  envBool("UPSTREAM_BASE_FROM_HEADER", true),
+			Proxy:            strings.TrimSpace(envStr("UPSTREAM_PROXY", "")),
+			AllowProxyHeader: envBool("UPSTREAM_PROXY_FROM_HEADER", false),
+			NoProxy:          strings.TrimSpace(envStr("UPSTREAM_NO_PROXY", "localhost,127.0.0.1,::1")),
 			Timeout:          envDur("UPSTREAM_TIMEOUT", 120*time.Second),
 			FirstByteTimeout: envDur("UPSTREAM_FIRST_BYTE_TIMEOUT", 30*time.Second),
 			Protocols:        loadProtocolBases(),
@@ -174,6 +198,8 @@ func Load(envFile string) (*Config, error) {
 			LogUpstreamModel: envBool("LOG_UPSTREAM_MODEL", true),
 			ExcludedURLs:     envList("EXCLUDED_URLS"),
 			MetricInterval:   envDur("OBS_METRIC_INTERVAL", 60*time.Second),
+			// 用 AllowZero：0 是「只信 RemoteAddr」的有效取值，不是未设置。
+			TrustedProxyHops: envIntAllowZero("TRUSTED_PROXY_HOPS", 0),
 		},
 	}
 
@@ -233,6 +259,15 @@ func (c *Config) Validate() error {
 			errs = append(errs, err)
 		}
 	}
+	// 代理配错的表现是「所有请求超时且无从判断原因」，启动期拦掉比线上查便宜。
+	if c.Upstream.Proxy != "" {
+		norm, err := proxyurl.Validate(c.Upstream.Proxy)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("UPSTREAM_PROXY: %w", err))
+		} else {
+			c.Upstream.Proxy = norm
+		}
+	}
 	for name, base := range c.Upstream.Protocols {
 		if err := checkBase("UPSTREAM_BASE_"+strings.ToUpper(name), base); err != nil {
 			errs = append(errs, err)
@@ -281,6 +316,9 @@ func (c *Config) Summary() []any {
 		"upstream_overrides", protos,
 		"base_from_header", c.Upstream.AllowBaseHeader,
 		"upstream_key_fallback", c.Upstream.Key != "",
+		// 仅 scheme://host：代理 URL 的 userinfo 段常带密码。
+		"upstream_proxy", orNone(proxyurl.Redact(c.Upstream.Proxy)),
+		"proxy_from_header", c.Upstream.AllowProxyHeader,
 		"sanitize", c.SanitizeEnabled(),
 		"strict_mapping", c.Mapping.Strict,
 		"obs", c.Obs.Enabled,

@@ -77,7 +77,7 @@ func run(envFile string, checkOnly bool) error {
 		defer cancel()
 		o.Shutdown(sctx)
 	}()
-	tr := upstream.NewTransport(cfg.Limits.MaxConns)
+	tr := upstream.NewRoundTripper(cfg.Limits.MaxConns, cfg.Upstream)
 	defer tr.CloseIdleConnections()
 
 	gw := gateway.New(cfg, upstream.NewClient(tr, cfg.Upstream), o)

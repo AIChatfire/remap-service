@@ -3,6 +3,8 @@ package gateway
 import (
 	"net/http"
 	"strings"
+
+	"github.com/betterme/remap-service/internal/upstream"
 )
 
 // 网关内部协议头。这些头不会转发给上游。
@@ -13,6 +15,8 @@ const (
 	BaseHeader = "X-Upstream-Base"
 	// CapHeader 承载「能力 -> 上游模型」的声明，用于按能力做故障切换。
 	CapHeader = "X-Model-Capability"
+	// ProxyHeader 覆盖本次请求的出网代理，值为完整 URL。
+	ProxyHeader = "X-Upstream-Proxy"
 )
 
 // credentialHeaders 是可能承载客户端凭据的请求头，按优先级排列。
@@ -76,7 +80,31 @@ func isCredentialHeader(name string) bool {
 func isInternalHeader(name string) bool {
 	return strings.EqualFold(name, MapHeader) ||
 		strings.EqualFold(name, BaseHeader) ||
-		strings.EqualFold(name, CapHeader)
+		strings.EqualFold(name, CapHeader) ||
+		strings.EqualFold(name, ProxyHeader)
+}
+
+// resolveProxy 决定本次请求的出网代理。
+//
+// 优先级：X-Upstream-Proxy 请求头 > UPSTREAM_PROXY 配置 > 环境变量。
+// 返回空串表示不做 per-request 覆盖（由 Router 落到默认出口）。
+//
+// 与 resolveBase 一致：头存在但非法时返回 ok=false 而非静默回落 ——
+// 代理配错时静默直连可能让内网流量走到公网出口。
+func (g *Gateway) resolveProxy(r *http.Request) (string, bool) {
+	v := strings.TrimSpace(r.Header.Get(ProxyHeader))
+	if v == "" {
+		return "", true
+	}
+	if !g.cfg.Upstream.AllowProxyHeader {
+		// 未开启时视作未声明，直接忽略。头本身仍不会转发给上游。
+		return "", true
+	}
+	p, err := upstream.ValidateProxy(v)
+	if err != nil {
+		return "", false
+	}
+	return p, true
 }
 
 // resolveBase 决定本次请求的上游地址。

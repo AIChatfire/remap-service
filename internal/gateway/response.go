@@ -2,13 +2,16 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
+	"syscall"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/net/http2"
 
 	"github.com/betterme/remap-service/internal/obs"
 	"github.com/betterme/remap-service/internal/protocol"
@@ -67,9 +70,25 @@ func (g *Gateway) pipeStream(
 
 	if err != nil {
 		st.err = err
-		st.outcome = "stream_broken"
-		span.SetStatus(codes.Error, err.Error())
-		obs.Add(ctx, st.mx.UpstreamErr, 1, a)
+		switch {
+		// 客户端提前断开不是故障：span 保持 Unset，也不计上游错误，
+		// 否则长耗时流式请求会因用户主动取消而在看板上大面积泛红。
+		case isClientGone(err):
+			st.outcome = "client_gone"
+			span.SetAttributes(attribute.Bool("gateway.client_gone", true))
+
+		// 上游正常收尾（EOF 截断 / GOAWAY NO_ERROR）同样不是故障。
+		// 已下发的事件全部有效，客户端拿到的内容是完整的。
+		case isUpstreamGracefulEnd(err):
+			st.outcome = "stream_eof"
+			st.err = nil // 不进错误日志，避免正常收尾刷屏
+			span.SetAttributes(attribute.Bool("gateway.upstream_eof", true))
+
+		default:
+			st.outcome = "stream_broken"
+			span.SetStatus(codes.Error, err.Error())
+			obs.Add(ctx, st.mx.UpstreamErr, 1, a)
+		}
 	}
 	return resp.StatusCode
 }
@@ -138,6 +157,55 @@ func (g *Gateway) pipeBuffered(
 		span.SetStatus(codes.Error, "upstream status "+strconv.Itoa(resp.StatusCode))
 	}
 	return resp.StatusCode
+}
+
+// isClientGone 判断错误是否源于客户端提前离开（主动取消或连接被关闭），
+// 而非上游或网关自身故障。这类错误在流式长连接里属于常态，
+// 不应污染 span 状态与上游错误率。
+//
+// 覆盖的形态均经诊断测试实测确认（见 classify_test.go）：
+//   - context.Canceled：客户端关闭请求导致 ctx 取消
+//   - io.ErrClosedPipe：向已关闭的响应体写入
+//   - EPIPE / ECONNRESET：TCP 层对端已断
+//   - http2 RST_STREAM(CANCEL)：h2 客户端取消的等价形态
+func isClientGone(err error) bool {
+	switch {
+	case errors.Is(err, context.Canceled),
+		errors.Is(err, io.ErrClosedPipe),
+		errors.Is(err, syscall.EPIPE),
+		errors.Is(err, syscall.ECONNRESET),
+		errors.Is(err, http.ErrBodyReadAfterClose):
+		return true
+	}
+	// HTTP/2 下客户端取消不映射为上面任何一个 errno，而是 RST_STREAM。
+	var se http2.StreamError
+	if errors.As(err, &se) {
+		return se.Code == http2.ErrCodeCancel
+	}
+	return false
+}
+
+// isUpstreamGracefulEnd 判断错误是否为上游「正常收尾」而非故障。
+//
+// 大模型上游有两种常见的合法收尾方式会在 Go 侧表现为 error：
+//
+//   - io.ErrUnexpectedEOF：生成结束后直接关闭连接，末个事件没有终止换行。
+//     SSE 规范允许流以 EOF 结束，此时已下发的事件全部有效，客户端也已拿到
+//     完整内容 —— 记成故障会让看板出现与实际体验不符的错误率。
+//   - GOAWAY(NO_ERROR)：上游实例优雅下线/滚动重启，通知本端不要再复用连接。
+//     这是协议层的正常信号，与「上游挂了」是两件事。
+//
+// 刻意不覆盖的形态：GOAWAY 携带非 NO_ERROR 错误码、RST_STREAM(INTERNAL_ERROR)
+// 等，它们代表上游真异常，必须计入错误率。
+func isUpstreamGracefulEnd(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ga http2.GoAwayError
+	if errors.As(err, &ga) {
+		return ga.ErrCode == http2.ErrCodeNo
+	}
+	return false
 }
 
 // writeError 以 OpenAI 兼容格式返回网关自身产生的错误。
