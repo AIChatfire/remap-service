@@ -67,26 +67,74 @@ const (
 	AttrFailoverFrom = "gateway.failover.from_model"
 	// AttrFailoverTo 是切换后实际承接请求的上游模型名。
 	AttrFailoverTo = "gateway.failover.to_model"
+
+	// AttrFailoverOutcome 说明切换的最终结局，三取一：
+	//
+	//   succeeded  切换救回了请求（客户端收到 2xx/3xx）
+	//   exhausted  备用模型也返回错误，主备同时不可用 —— 最该告警的形态
+	//   aborted    重试请求没发出去（改写/构造/连接失败），是网关侧问题
+	//
+	// succeeded 与 exhausted 的判据是**切换后的最终状态码**，不是
+	// 「重试请求是否发出去了」。此前三者共用同一组属性、一律记作切换
+	// 成功，于是主备双挂在看板上与正常降级完全无法区分。
+	AttrFailoverOutcome = "gateway.failover.outcome"
+
+	// AttrUpstreamPath 是**上游**请求的实际路径（如 /api/v3/chat/completions）。
+	//
+	// 刻意不用 OTel 语义约定的 url.path：那个键属于**入站**请求
+	// （客户端打进网关的 /v1/chat/completions），被上游路径覆盖后
+	// Logfire 的 HTTP Request Attributes 面板会显示上游路径，
+	// 等于伪造了客户端请求的事实。两者必须并存才能看出重写前后。
+	AttrUpstreamPath = "gateway.upstream.path"
 )
 
 // RecordFailover 把「发生过故障切换」这件事落到请求 span 的属性上。
 //
 // 与 RecordAttemptFailure 的分工：后者用事件承载单次尝试的完整现场
-// （错误正文、Go 错误类型），可重复；本函数只在切换**成功**后调用一次，
+// （错误正文、Go 错误类型），可重复；本函数每请求最多调用一次，
 // 提供少量高价值、可聚合的维度。
 //
-// 同样不改 span 状态 —— 对客户端确实没故障，标红会污染 SLO。
+// 不改 span 状态。切换成功时对客户端确实没故障；切换失败时客户端收到的
+// 错误由正常的错误上报路径标红，这里再标一次只会重复。
 //
 // status <= 0 表示首次失败在传输层（没有状态码），此时不写状态码属性，
 // 避免看板上出现无意义的 0 值影响聚合。
-func RecordFailover(span trace.Span, stage, fromModel, toModel string, status int) {
+//
+// toModel 为空表示切换未能完成（RecordFailoverExhausted 的场景）。
+// finalStatus 是切换后上游返回的状态码，决定 outcome：
+//   - < 400（含传输层成功的 0）视为 succeeded，请求被救回；
+//   - >= 400 视为 exhausted，备用模型同样失败，主备双挂。
+//
+// 判据放在这里而不是各调用点：调用点只知道「重试请求发出去了」，
+// 把「发出去」误当成「救回来」曾让 exhausted 形态完全查不到。
+func RecordFailover(span trace.Span, stage, fromModel, toModel string, status, finalStatus int) {
+	outcome := "succeeded"
+	if finalStatus >= 400 {
+		outcome = "exhausted"
+	}
+	recordFailover(span, stage, fromModel, toModel, status, outcome)
+}
+
+// RecordFailoverAborted 记录「重试请求根本没发出去」。
+//
+// 与 exhausted 不同：那是备用模型也返回了错误，这是切换动作自身失败
+// （改写请求体失败、构造请求失败、连不上备用上游）。两者的排查方向
+// 完全相反 —— 前者要查上游容量，后者要查网关配置。
+//
+// 不写 to_model：没有任何模型承接过这个请求。
+func RecordFailoverAborted(span trace.Span, stage, fromModel string, status int) {
+	recordFailover(span, stage, fromModel, "", status, "aborted")
+}
+
+func recordFailover(span trace.Span, stage, fromModel, toModel string, status int, outcome string) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	attrs := make([]attribute.KeyValue, 0, 5)
+	attrs := make([]attribute.KeyValue, 0, 6)
 	attrs = append(attrs,
 		attribute.Bool(AttrFailover, true),
 		attribute.String(AttrFailoverStage, stage),
+		attribute.String(AttrFailoverOutcome, outcome),
 	)
 	if status > 0 {
 		attrs = append(attrs, attribute.Int(AttrFailoverStatus, status))
@@ -196,7 +244,9 @@ func RecordGatewayError(span trace.Span, kind, clientMsg string, err error) {
 // stage 说明失败发生在重试的哪一步（rewrite / build / transport / status），
 // 定位「切换本身没生效」时是第一手线索。
 //
-// urlPath 是上游请求的实际路径（如 /v1/chat/completions），便于快速定位端点。
+// urlPath 是**上游**请求的实际路径（如 /api/v3/chat/completions），
+// 落在 AttrUpstreamPath 而非 url.path —— 后者属于入站请求，覆盖它会让
+// 看板上的客户端请求路径显示成上游路径，等于伪造事实。
 //
 // errOrBody 可以是 Go error（transport / build 阶段）或 []byte 错误正文
 // （status 阶段，此时上游返回了 4xx/5xx 响应体）。status 阶段必须传正文：
@@ -211,7 +261,7 @@ func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status 
 		attrs = append(attrs, attribute.String("gateway.attempt.model", model))
 	}
 	if urlPath != "" {
-		attrs = append(attrs, attribute.String("url.path", urlPath))
+		attrs = append(attrs, attribute.String(AttrUpstreamPath, urlPath))
 	}
 	if status > 0 {
 		attrs = append(attrs, attribute.Int("gateway.attempt.status_code", status))
@@ -313,7 +363,9 @@ func rootCause(err error) string {
 // error.message、Anthropic 的 error.type、火山的 InvalidParameter），
 // 网关猜哪个字段重要必然会漏，把原文交给看板由人判断更可靠。
 //
-// urlPath 是上游请求的实际路径（如 /v1/chat/completions），便于快速定位端点。
+// urlPath 是**上游**请求的实际路径（如 /api/v3/chat/completions），
+// 落在 AttrUpstreamPath 而非 url.path —— 后者属于入站请求，覆盖它会让
+// 看板上的客户端请求路径显示成上游路径，等于伪造事实。
 //
 // body 超过 limit 时截断，并通过 AttrErrBodySize / AttrErrTruncated
 // 让看板上能看出「这不是全文」。limit <= 0 表示不上报正文。
@@ -323,7 +375,7 @@ func RecordUpstreamError(span trace.Span, status int, urlPath, contentType strin
 	}
 	span.SetAttributes(attribute.String(AttrErrKind, "upstream_status"))
 	if urlPath != "" {
-		span.SetAttributes(attribute.String("url.path", urlPath))
+		span.SetAttributes(attribute.String(AttrUpstreamPath, urlPath))
 	}
 	frag := RecordErrorBody(span, contentType, body, limit)
 

@@ -120,6 +120,70 @@ func TestFailoverAttemptFailureIsRecorded(t *testing.T) {
 	if got := attrString(span, "gateway.error.body"); got == "" {
 		t.Error("最终失败的正文仍应上报")
 	}
+
+	// 主备同时不可用必须在 span 属性上与「正常降级」区分开。
+	//
+	// 这里切换动作是成功的（请求确实发到了 backup-up），但备用模型同样
+	// 返回 503，请求并没有被救回。若仍记 succeeded，看板上这条与真正
+	// 救回的请求完全同形，主备双挂就无法告警。
+	sp := findSpanWithAttr(t, sr, "gateway.failover.outcome")
+	if got := attrString(sp, "gateway.failover.outcome"); got != "exhausted" {
+		t.Errorf("备用模型也失败时 outcome 应为 exhausted，实际 %q", got)
+	}
+	if got := attrInt(sp, "gateway.failover.first_status_code"); got != http.StatusServiceUnavailable {
+		t.Errorf("应记录首次失败的 503，实际 %d", got)
+	}
+	if got := attrString(sp, "gateway.failover.from_model"); got != "primary-up" {
+		t.Errorf("from_model 应为 primary-up，实际 %q", got)
+	}
+	// 请求确实发到了备用模型，to_model 应有值 —— exhausted 不等于
+	// 「没切过去」，这一条区分了 exhausted 与 aborted。
+	if got := attrString(sp, "gateway.failover.to_model"); got != "backup-up" {
+		t.Errorf("to_model 应为 backup-up，实际 %q", got)
+	}
+
+	// span 上的 url.path 是入站路径，必须保持客户端实际打的那个。
+	if got := attrString(sp, "url.path"); got != "/v1/chat/completions" {
+		t.Errorf("span 的 url.path 应为入站路径，实际 %q", got)
+	}
+
+	// 上游路径只能落在独立键上。断言分两条且都必要：
+	// 只断言新键存在时，事件里同时写了 url.path 也能通过 —— 而那正是
+	// 之前的 bug 形态（上游路径混进入站语义的键，两种路径无法区分）。
+	ev2 := findEvent(t, sr, "gateway.attempt_failed")
+	if got := eventString(ev2, "gateway.upstream.path"); got == "" {
+		t.Error("事件缺少 gateway.upstream.path，无法定位上游端点")
+	}
+	if got := eventString(ev2, "url.path"); got != "" {
+		t.Errorf("事件不得写 url.path（那是入站语义），实际 %q", got)
+	}
+}
+
+// 切换成功时 outcome 必须是 succeeded，与 exhausted 形成可聚合的二分。
+func TestFailoverOutcomeSucceeded(t *testing.T) {
+	var n int32
+	sr := tracetest.NewSpanRecorder()
+	gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"quota exceeded"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"backup-up","choices":[]}`))
+	}, func(c *config.Config) {
+		c.Mapping.Models = map[string][]string{"pub": {"primary-up"}}
+		c.Mapping.Fallback = []string{"backup-up"}
+		c.Mapping.FailoverOnError = true
+	})
+
+	resp := post(t, gs, "/v1/chat/completions", `{"model":"pub"}`, nil)
+	defer resp.Body.Close()
+
+	sp := findSpanWithAttr(t, sr, "gateway.failover.outcome")
+	if got := attrString(sp, "gateway.failover.outcome"); got != "succeeded" {
+		t.Errorf("切换成功时 outcome 应为 succeeded，实际 %q", got)
+	}
 }
 
 func findEvent(t *testing.T, sr *tracetest.SpanRecorder, name string) sdktrace.Event {

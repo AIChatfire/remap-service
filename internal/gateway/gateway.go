@@ -266,18 +266,25 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	// 连接层失败：还没有任何字节写给客户端，可以安全地换模型重试。
 	if err != nil && plan.enabled {
+		// applyPlan 会覆盖 st.upstreamModel，from_model 必须在切换前取。
+		failedModel := st.upstreamModel
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st, nil); ok {
 			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
 			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
 			// 完全不可见，上游某个模型静默挂掉也无人发现。
-			failedModel := st.upstreamModel
 			obs.RecordAttemptFailure(span, "transport", failedModel, ureq.URL.Path, 0, err)
 			resp, cancel, err = r2, c2, nil
 			st.applyPlan(plan)
 			// 事件之外再落一份 span 属性：事件属性在 trace 列表和筛选里
 			// 不可见，只有 span 属性能回答「多少请求走了兜底」。
 			// 必须在 applyPlan 之后取 to_model，之前取 from_model。
-			obs.RecordFailover(span, "transport", failedModel, st.upstreamModel, 0)
+			// first_status 传 0（传输层失败无状态码），outcome 仍按切换后
+			// 的实际状态码判定 —— 连上了但备用返回 503 也是 exhausted。
+			obs.RecordFailover(span, "transport", failedModel, st.upstreamModel,
+				0, resp.StatusCode)
+		} else {
+			// 主备都连不上，重试请求没能发出。
+			obs.RecordFailoverAborted(span, "transport", failedModel, 0)
 		}
 	}
 	if err != nil {
@@ -310,7 +317,15 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			resp, cancel = r2, c2
 			st.applyPlan(plan)
 			obs.Add(ctx, st.mx.Failover, 1, st.metricAttrs("failover", resp.StatusCode))
-			obs.RecordFailover(span, "status", failedModel, st.upstreamModel, firstStatus)
+			// outcome 由切换后的状态码决定：备用模型同样 429/503 时这次
+			// 切换并没有救回请求，记 exhausted。传 resp.StatusCode 而非
+			// 在此处判断，判据集中在 obs 侧，避免两个调用点各写一套。
+			obs.RecordFailover(span, "status", failedModel, st.upstreamModel,
+				firstStatus, resp.StatusCode)
+		} else {
+			// 重试请求没发出去（改写/构造/连接失败），是网关侧问题，
+			// 排查方向与「备用模型也挂」完全不同，需单独一种 outcome。
+			obs.RecordFailoverAborted(span, "status", failedModel, firstStatus)
 		}
 	}
 	defer cancel()

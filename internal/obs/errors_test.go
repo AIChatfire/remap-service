@@ -64,8 +64,14 @@ func TestRecordUpstreamErrorCarriesRawBody(t *testing.T) {
 	if ct, ok := attrOf(t, s, AttrErrContentType); !ok || ct.AsString() != "application/json" {
 		t.Error("Content-Type 缺失，无法区分上游应用层报错与被反代拦截")
 	}
-	if path, ok := attrOf(t, s, "url.path"); !ok || path.AsString() != "/v1/chat/completions" {
-		t.Error("url.path 缺失，无法快速定位端点")
+	if path, ok := attrOf(t, s, AttrUpstreamPath); !ok || path.AsString() != "/v1/chat/completions" {
+		t.Error("上游路径缺失，无法快速定位端点")
+	}
+	// 上游路径绝不能占用 url.path：那是入站请求的语义约定键，
+	// 覆盖后 Logfire 的 HTTP Request Attributes 会显示上游路径，
+	// 等于伪造了客户端请求的事实。
+	if _, ok := attrOf(t, s, "url.path"); ok {
+		t.Error("上游路径污染了入站语义键 url.path")
 	}
 	if _, ok := attrOf(t, s, AttrErrTruncated); ok {
 		t.Error("未截断时不应出现 truncated 标记")
