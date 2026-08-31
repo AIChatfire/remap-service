@@ -48,7 +48,7 @@ func attrOf(t *testing.T, s sdktrace.ReadOnlySpan, key string) (attribute.Value,
 func TestRecordUpstreamErrorCarriesRawBody(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	body := []byte(`{"error":{"message":"model deepseek-v3 not found","code":"invalid_request"}}`)
-	RecordUpstreamError(span, 404, "application/json", body, 1024)
+	RecordUpstreamError(span, 404, "/v1/chat/completions", "application/json", body, 1024)
 	s := done()
 
 	got, ok := attrOf(t, s, AttrErrBody)
@@ -63,6 +63,9 @@ func TestRecordUpstreamErrorCarriesRawBody(t *testing.T) {
 	}
 	if ct, ok := attrOf(t, s, AttrErrContentType); !ok || ct.AsString() != "application/json" {
 		t.Error("Content-Type 缺失，无法区分上游应用层报错与被反代拦截")
+	}
+	if path, ok := attrOf(t, s, "url.path"); !ok || path.AsString() != "/v1/chat/completions" {
+		t.Error("url.path 缺失，无法快速定位端点")
 	}
 	if _, ok := attrOf(t, s, AttrErrTruncated); ok {
 		t.Error("未截断时不应出现 truncated 标记")
@@ -83,7 +86,7 @@ func TestRecordUpstreamErrorTruncatesOnRuneBoundary(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	body := []byte("请求参数不合法：模型名称未注册")
 	limit := 10 // 落在某个 3 字节汉字中间
-	RecordUpstreamError(span, 400, "application/json", body, limit)
+	RecordUpstreamError(span, 400, "/v1/chat/completions", "application/json", body, limit)
 	s := done()
 
 	got, _ := attrOf(t, s, AttrErrBody)
@@ -106,7 +109,7 @@ func TestRecordUpstreamErrorTruncatesOnRuneBoundary(t *testing.T) {
 func TestRecordUpstreamErrorLimitZeroOmitsBody(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	body := []byte(`{"error":"secret detail"}`)
-	RecordUpstreamError(span, 500, "application/json", body, 0)
+	RecordUpstreamError(span, 500, "/v1/chat/completions", "application/json", body, 0)
 	s := done()
 
 	if _, ok := attrOf(t, s, AttrErrBody); ok {
@@ -259,7 +262,7 @@ func TestRecordGatewayErrorKeepsBothMessages(t *testing.T) {
 func TestRecordErrorNilSafe(t *testing.T) {
 	RecordError(nil, "k", errors.New("x"))
 	RecordGatewayError(nil, "k", "m", nil)
-	RecordUpstreamError(nil, 500, "application/json", []byte("x"), 1024)
+	RecordUpstreamError(nil, 500, "/v1/test", "application/json", []byte("x"), 1024)
 
 	span, done := newRecordedSpan(t)
 	RecordError(span, "no_upstream", nil)
@@ -332,7 +335,7 @@ func TestStructuredAttrsThroughWrap(t *testing.T) {
 // 只能看到一句无信息的超时。
 func TestAttemptFailureCarriesStructuredAttrs(t *testing.T) {
 	span, done := newRecordedSpan(t)
-	RecordAttemptFailure(span, "transport", "m-up", 0, &attrErr{
+	RecordAttemptFailure(span, "transport", "m-up", "/v1/chat/completions", 0, &attrErr{
 		msg:   "timeout",
 		attrs: map[string]string{"gateway.timeout.kind": "first_byte"},
 	})
@@ -373,7 +376,7 @@ func TestPlainErrorNoExtraAttrs(t *testing.T) {
 func TestAttemptFailureCarriesUpstreamErrorBody(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	body := []byte(`{"error":{"message":"Rate limit exceeded for model deepseek-v3","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
-	RecordAttemptFailure(span, "status", "deepseek-v3-flash-ga-260731", 429, body)
+	RecordAttemptFailure(span, "status", "deepseek-v3-flash-ga-260731", "/v1/chat/completions", 429, body)
 	s := done()
 
 	if len(s.Events()) != 1 {
@@ -425,7 +428,7 @@ func TestAttemptFailureBodyTruncatesOnRuneBoundary(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	// 构造一个 3KB 的中文错误正文，超过 2KB 截断阈值
 	body := []byte(strings.Repeat("错误详情：配额已用尽。", 100))
-	RecordAttemptFailure(span, "status", "m", 429, body)
+	RecordAttemptFailure(span, "status", "m", "/v1/chat/completions", 429, body)
 	s := done()
 
 	evt := s.Events()[0]
@@ -454,7 +457,7 @@ func TestAttemptFailureBodyTruncatesOnRuneBoundary(t *testing.T) {
 // 空正文不应产生正文相关属性。
 func TestAttemptFailureEmptyBodyIsNoop(t *testing.T) {
 	span, done := newRecordedSpan(t)
-	RecordAttemptFailure(span, "status", "m", 503, []byte{})
+	RecordAttemptFailure(span, "status", "m", "/v1/chat/completions", 503, []byte{})
 	s := done()
 
 	evt := s.Events()[0]

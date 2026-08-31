@@ -177,23 +177,25 @@ func (g *Gateway) retryWithFallback(
 	// 状态码失败时读首次响应正文：429/503 的具体原因（配额类型、剩余额度、
 	// 建议等待时间、过载详情）全在正文里，只有状态码无法定位根因。
 	// 读完后立刻关闭响应体归还连接，不阻塞后续重试。
+	var urlPath string
 	if firstResp != nil {
+		urlPath = firstResp.Request.URL.Path
 		limit := int64(g.cfg.Limits.MaxSanitizeBytes)
 		if firstResp.ContentLength >= 0 && firstResp.ContentLength < limit {
 			limit = firstResp.ContentLength
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(firstResp.Body, limit))
-		obs.RecordAttemptFailure(span, "status", st.upstreamModel, firstResp.StatusCode, errBody)
+		obs.RecordAttemptFailure(span, "status", st.upstreamModel, urlPath, firstResp.StatusCode, errBody)
 	}
 
 	nb, err := protocol.RewriteModel(body, plan.model)
 	if err != nil {
-		obs.RecordAttemptFailure(span, "rewrite", plan.model, 0, err)
+		obs.RecordAttemptFailure(span, "rewrite", plan.model, "", 0, err)
 		return nil, nil, false
 	}
 	ureq, err := g.buildRequest(ctx, r, spec, base, nb)
 	if err != nil {
-		obs.RecordAttemptFailure(span, "build", plan.model, 0, err)
+		obs.RecordAttemptFailure(span, "build", plan.model, "", 0, err)
 		return nil, nil, false
 	}
 	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
@@ -201,7 +203,7 @@ func (g *Gateway) retryWithFallback(
 		if cancel != nil {
 			cancel()
 		}
-		obs.RecordAttemptFailure(span, "transport", plan.model, 0, err)
+		obs.RecordAttemptFailure(span, "transport", plan.model, ureq.URL.Path, 0, err)
 		return nil, nil, false
 	}
 	return resp, cancel, true

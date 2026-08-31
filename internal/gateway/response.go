@@ -206,7 +206,7 @@ func (g *Gateway) recordUpstreamStatus(resp *http.Response, body []byte, st *sta
 	if ra := resp.Header.Get("Retry-After"); ra != "" {
 		span.SetAttributes(attribute.String("http.response.retry_after", ra))
 	}
-	obs.RecordUpstreamError(span, resp.StatusCode,
+	obs.RecordUpstreamError(span, resp.StatusCode, resp.Request.URL.Path,
 		resp.Header.Get("Content-Type"), body, g.o.ErrorBodyLimit())
 }
 

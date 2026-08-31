@@ -144,17 +144,22 @@ func RecordGatewayError(span trace.Span, kind, clientMsg string, err error) {
 // stage 说明失败发生在重试的哪一步（rewrite / build / transport / status），
 // 定位「切换本身没生效」时是第一手线索。
 //
+// urlPath 是上游请求的实际路径（如 /v1/chat/completions），便于快速定位端点。
+//
 // errOrBody 可以是 Go error（transport / build 阶段）或 []byte 错误正文
 // （status 阶段，此时上游返回了 4xx/5xx 响应体）。status 阶段必须传正文：
 // 429/503 的具体原因（配额类型、剩余额度、建议等待时间）全在正文里。
-func RecordAttemptFailure(span trace.Span, stage, model string, status int, errOrBody interface{}) {
+func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status int, errOrBody interface{}) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	attrs := make([]attribute.KeyValue, 0, 8)
+	attrs := make([]attribute.KeyValue, 0, 10)
 	attrs = append(attrs, attribute.String("gateway.attempt.stage", stage))
 	if model != "" {
 		attrs = append(attrs, attribute.String("gateway.attempt.model", model))
+	}
+	if urlPath != "" {
+		attrs = append(attrs, attribute.String("url.path", urlPath))
 	}
 	if status > 0 {
 		attrs = append(attrs, attribute.Int("gateway.attempt.status_code", status))
@@ -256,13 +261,18 @@ func rootCause(err error) string {
 // error.message、Anthropic 的 error.type、火山的 InvalidParameter），
 // 网关猜哪个字段重要必然会漏，把原文交给看板由人判断更可靠。
 //
+// urlPath 是上游请求的实际路径（如 /v1/chat/completions），便于快速定位端点。
+//
 // body 超过 limit 时截断，并通过 AttrErrBodySize / AttrErrTruncated
 // 让看板上能看出「这不是全文」。limit <= 0 表示不上报正文。
-func RecordUpstreamError(span trace.Span, status int, contentType string, body []byte, limit int) {
+func RecordUpstreamError(span trace.Span, status int, urlPath, contentType string, body []byte, limit int) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
 	span.SetAttributes(attribute.String(AttrErrKind, "upstream_status"))
+	if urlPath != "" {
+		span.SetAttributes(attribute.String("url.path", urlPath))
+	}
 	frag := RecordErrorBody(span, contentType, body, limit)
 
 	msg := "upstream status " + strconv.Itoa(status)

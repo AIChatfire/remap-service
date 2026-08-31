@@ -270,7 +270,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
 			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
 			// 完全不可见，上游某个模型静默挂掉也无人发现。
-			obs.RecordAttemptFailure(span, "transport", st.upstreamModel, 0, err)
+			obs.RecordAttemptFailure(span, "transport", st.upstreamModel, ureq.URL.Path, 0, err)
 			resp, cancel, err = r2, c2, nil
 			st.applyPlan(plan)
 		}
