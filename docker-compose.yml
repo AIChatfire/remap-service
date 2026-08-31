@@ -17,6 +17,7 @@ x-logging: &default-logging
 
 services:
   gateway:
+    container_name: remap
     build:
       context: .
       args:
