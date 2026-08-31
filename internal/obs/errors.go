@@ -143,11 +143,15 @@ func RecordGatewayError(span trace.Span, kind, clientMsg string, err error) {
 //
 // stage 说明失败发生在重试的哪一步（rewrite / build / transport / status），
 // 定位「切换本身没生效」时是第一手线索。
-func RecordAttemptFailure(span trace.Span, stage, model string, status int, err error) {
+//
+// errOrBody 可以是 Go error（transport / build 阶段）或 []byte 错误正文
+// （status 阶段，此时上游返回了 4xx/5xx 响应体）。status 阶段必须传正文：
+// 429/503 的具体原因（配额类型、剩余额度、建议等待时间）全在正文里。
+func RecordAttemptFailure(span trace.Span, stage, model string, status int, errOrBody interface{}) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	attrs := make([]attribute.KeyValue, 0, 6)
+	attrs := make([]attribute.KeyValue, 0, 8)
 	attrs = append(attrs, attribute.String("gateway.attempt.stage", stage))
 	if model != "" {
 		attrs = append(attrs, attribute.String("gateway.attempt.model", model))
@@ -155,16 +159,36 @@ func RecordAttemptFailure(span trace.Span, stage, model string, status int, err 
 	if status > 0 {
 		attrs = append(attrs, attribute.Int("gateway.attempt.status_code", status))
 	}
-	if err != nil {
-		attrs = append(attrs,
-			attribute.String(AttrErrDetail, err.Error()),
-			attribute.String(AttrErrType, fmt.Sprintf("%T", err)),
-		)
-		if cause := rootCause(err); cause != "" && cause != err.Error() {
-			attrs = append(attrs, attribute.String(AttrErrCause, cause))
+
+	switch v := errOrBody.(type) {
+	case error:
+		if v != nil {
+			attrs = append(attrs,
+				attribute.String(AttrErrDetail, v.Error()),
+				attribute.String(AttrErrType, fmt.Sprintf("%T", v)),
+			)
+			if cause := rootCause(v); cause != "" && cause != v.Error() {
+				attrs = append(attrs, attribute.String(AttrErrCause, cause))
+			}
+			attrs = append(attrs, structuredAttrs(v)...)
 		}
-		attrs = append(attrs, structuredAttrs(err)...)
+	case []byte:
+		if len(v) > 0 {
+			// 上游错误正文，按 UTF-8 截断到合理长度（默认 2KB）。
+			// 不走 RecordErrorBody：它会写 AttrErrBody 等全局属性，
+			// 而事件内的属性必须用带命名空间的键以区分多次尝试。
+			const limit = 2048
+			frag, trunc := truncateUTF8(v, limit)
+			attrs = append(attrs,
+				attribute.String("gateway.attempt.error_body", frag),
+				attribute.Int("gateway.attempt.error_body_size", len(v)),
+			)
+			if trunc {
+				attrs = append(attrs, attribute.Bool("gateway.attempt.error_truncated", true))
+			}
+		}
 	}
+
 	span.AddEvent("gateway.attempt_failed", trace.WithAttributes(attrs...))
 }
 

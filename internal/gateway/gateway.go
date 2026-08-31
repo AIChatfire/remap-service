@@ -266,7 +266,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	// 连接层失败：还没有任何字节写给客户端，可以安全地换模型重试。
 	if err != nil && plan.enabled {
-		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st); ok {
+		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st, nil); ok {
 			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
 			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
 			// 完全不可见，上游某个模型静默挂掉也无人发现。
@@ -292,14 +292,9 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 
 	// 状态码层失败：响应头已到但正文一个字节都没下发，同样可以重试。
-	// 注意必须先关掉首次响应体，否则连接无法归还连接池。
+	// 必须先读正文（用于上报）再关响应体归还连接。
 	if !st.failedOver && plan.shouldRetry(resp.StatusCode) {
-		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st); ok {
-			// 被切掉的那次响应带着上游的真实拒绝原因（429 的配额说明、
-			// 503 的过载详情）。这里不读它的正文：连接要立刻归还连接池，
-			// 为一次已被替代的失败多读一次 IO 不值得。状态码 + 模型名
-			// 已足够回答「哪个模型在什么状态码上被切掉了」。
-			obs.RecordAttemptFailure(span, "status", st.upstreamModel, resp.StatusCode, nil)
+		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st, resp); ok {
 			resp.Body.Close()
 			cancel()
 			resp, cancel = r2, c2

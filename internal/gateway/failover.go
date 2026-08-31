@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"io"
 	"net/http"
 
 	"go.opentelemetry.io/otel/trace"
@@ -162,13 +163,28 @@ func (st *state) applyPlan(p failoverPlan) {
 //
 // 调用前提（由调用方保证）：首次响应的正文尚未写给客户端。
 // 一旦有任何字节下发就不能重试 —— 客户端会收到两段拼接的响应。
+//
+// firstResp 非 nil 时表示首次失败在状态码层，必须读其正文用于上报。
 func (g *Gateway) retryWithFallback(
 	ctx context.Context, r *http.Request, spec *protocol.Spec,
 	base string, body []byte, plan failoverPlan, st *state,
+	firstResp *http.Response,
 ) (*http.Response, context.CancelFunc, bool) {
 	// 重试自身的失败必须留痕。调用方只看到 ok == false，随后回落到首次
 	// 失败的错误 —— 若这里静默返回，「切换为什么没生效」在看板上无迹可寻。
 	span := trace.SpanFromContext(ctx)
+
+	// 状态码失败时读首次响应正文：429/503 的具体原因（配额类型、剩余额度、
+	// 建议等待时间、过载详情）全在正文里，只有状态码无法定位根因。
+	// 读完后立刻关闭响应体归还连接，不阻塞后续重试。
+	if firstResp != nil {
+		limit := int64(g.cfg.Limits.MaxSanitizeBytes)
+		if firstResp.ContentLength >= 0 && firstResp.ContentLength < limit {
+			limit = firstResp.ContentLength
+		}
+		errBody, _ := io.ReadAll(io.LimitReader(firstResp.Body, limit))
+		obs.RecordAttemptFailure(span, "status", st.upstreamModel, firstResp.StatusCode, errBody)
+	}
 
 	nb, err := protocol.RewriteModel(body, plan.model)
 	if err != nil {

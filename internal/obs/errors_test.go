@@ -368,6 +368,104 @@ func TestPlainErrorNoExtraAttrs(t *testing.T) {
 	}
 }
 
+// status failover 时必须记录上游错误正文：429/503 的具体原因
+// （配额类型、剩余额度、建议等待时间）全在正文里。
+func TestAttemptFailureCarriesUpstreamErrorBody(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	body := []byte(`{"error":{"message":"Rate limit exceeded for model deepseek-v3","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
+	RecordAttemptFailure(span, "status", "deepseek-v3-flash-ga-260731", 429, body)
+	s := done()
+
+	if len(s.Events()) != 1 {
+		t.Fatalf("期望 1 个事件，实际 %d", len(s.Events()))
+	}
+	evt := s.Events()[0]
+	if evt.Name != "gateway.attempt_failed" {
+		t.Errorf("事件名应为 gateway.attempt_failed，实际 %q", evt.Name)
+	}
+
+	var foundBody, foundSize, foundStatus bool
+	var bodyVal, sizeVal, statusVal string
+	for _, kv := range evt.Attributes {
+		k := string(kv.Key)
+		switch k {
+		case "gateway.attempt.error_body":
+			foundBody = true
+			bodyVal = kv.Value.AsString()
+		case "gateway.attempt.error_body_size":
+			foundSize = true
+			sizeVal = fmt.Sprintf("%d", kv.Value.AsInt64())
+		case "gateway.attempt.status_code":
+			foundStatus = true
+			statusVal = fmt.Sprintf("%d", kv.Value.AsInt64())
+		}
+	}
+
+	if !foundBody {
+		t.Error("缺少 gateway.attempt.error_body 属性，无法在看板上看到具体限流原因")
+	}
+	if !strings.Contains(bodyVal, "Rate limit exceeded") {
+		t.Errorf("正文应含上游原始错误信息，实际 %q", bodyVal)
+	}
+	if !foundSize || sizeVal != fmt.Sprintf("%d", len(body)) {
+		t.Errorf("缺少或错误的 error_body_size，期望 %d 实际 %s", len(body), sizeVal)
+	}
+	if !foundStatus || statusVal != "429" {
+		t.Errorf("缺少或错误的 status_code，期望 429 实际 %s", statusVal)
+	}
+
+	// status failover 的中间失败不应标红 span
+	if s.Status().Code == codes.Error {
+		t.Error("状态码失败但成功切换时，span 不应标红")
+	}
+}
+
+// 错误正文过长时按 UTF-8 边界截断，不能切出半个字符。
+func TestAttemptFailureBodyTruncatesOnRuneBoundary(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	// 构造一个 3KB 的中文错误正文，超过 2KB 截断阈值
+	body := []byte(strings.Repeat("错误详情：配额已用尽。", 100))
+	RecordAttemptFailure(span, "status", "m", 429, body)
+	s := done()
+
+	evt := s.Events()[0]
+	var bodyVal string
+	var truncated bool
+	for _, kv := range evt.Attributes {
+		switch string(kv.Key) {
+		case "gateway.attempt.error_body":
+			bodyVal = kv.Value.AsString()
+		case "gateway.attempt.error_truncated":
+			truncated = kv.Value.AsBool()
+		}
+	}
+
+	if len(bodyVal) > 2048 {
+		t.Errorf("截断后正文 %d 字节，超过 2KB 上限", len(bodyVal))
+	}
+	if !utf8Valid(bodyVal) {
+		t.Errorf("截断产生了非法 UTF-8: %q", bodyVal)
+	}
+	if !truncated {
+		t.Error("截断后必须标记 error_truncated=true")
+	}
+}
+
+// 空正文不应产生正文相关属性。
+func TestAttemptFailureEmptyBodyIsNoop(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	RecordAttemptFailure(span, "status", "m", 503, []byte{})
+	s := done()
+
+	evt := s.Events()[0]
+	for _, kv := range evt.Attributes {
+		k := string(kv.Key)
+		if strings.Contains(k, "error_body") || strings.Contains(k, "error_truncated") {
+			t.Errorf("空正文不应产生正文相关属性: %s", k)
+		}
+	}
+}
+
 func utf8Valid(s string) bool {
 	for _, r := range s {
 		if r == '\uFFFD' {
