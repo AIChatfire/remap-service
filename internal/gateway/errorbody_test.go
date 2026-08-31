@@ -202,6 +202,17 @@ func findSpanWithAttr(t *testing.T, sr *tracetest.SpanRecorder, key string) sdkt
 	return nil
 }
 
+// 返回 0 表示属性不存在或确实为 0。需要区分两者时，先用
+// findSpanWithAttr 确认属性存在。
+func attrInt(s sdktrace.ReadOnlySpan, key string) int {
+	for _, kv := range s.Attributes() {
+		if string(kv.Key) == key {
+			return int(kv.Value.AsInt64())
+		}
+	}
+	return 0
+}
+
 func attrString(s sdktrace.ReadOnlySpan, key string) string {
 	for _, kv := range s.Attributes() {
 		if string(kv.Key) == key {

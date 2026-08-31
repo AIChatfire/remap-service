@@ -53,6 +53,33 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 		t.Errorf("stage 应为 status，实际 %q", got)
 	}
 
+	// 事件之外，429 还必须作为 span 属性存在。
+	//
+	// 只进事件是不够的：Logfire 的 trace 列表、Full Trace 视图和属性筛选
+	// 都只读 span 属性，切换成功后 http.response.status_code 恒为 200，
+	// 于是「今天有多少请求被 429 顶掉」必须逐条展开事件才能回答。
+	sp := findSpanWithAttr(t, sr, "gateway.failover.first_status_code")
+	if got := attrInt(sp, "gateway.failover.first_status_code"); got != http.StatusTooManyRequests {
+		t.Errorf("span 属性应记录首次失败的 429，实际 %d", got)
+	}
+	if got := attrString(sp, "gateway.failover.stage"); got != "status" {
+		t.Errorf("failover.stage 应为 status，实际 %q", got)
+	}
+	// from/to 必须真的分别是切换前后的模型：若两者相同，说明取值时机
+	// 错在 applyPlan 之后，属性看着有值实则无法定位是谁挂了。
+	from := attrString(sp, "gateway.failover.from_model")
+	to := attrString(sp, "gateway.failover.to_model")
+	if from != "primary-up" {
+		t.Errorf("from_model 应为切换前的 primary-up，实际 %q", from)
+	}
+	if to != "backup-up" {
+		t.Errorf("to_model 应为切换后的 backup-up，实际 %q", to)
+	}
+	// span 的最终状态码仍应是客户端实际收到的 200，两者不能混淆。
+	if got := attrInt(sp, "http.response.status_code"); got != http.StatusOK {
+		t.Errorf("最终状态码应保持 200，实际 %d", got)
+	}
+
 	// 关键断言：整个 span 不得为 Error。
 	for _, s := range sr.Ended() {
 		if s.Status().Code == codes.Error {

@@ -270,9 +270,14 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
 			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
 			// 完全不可见，上游某个模型静默挂掉也无人发现。
-			obs.RecordAttemptFailure(span, "transport", st.upstreamModel, ureq.URL.Path, 0, err)
+			failedModel := st.upstreamModel
+			obs.RecordAttemptFailure(span, "transport", failedModel, ureq.URL.Path, 0, err)
 			resp, cancel, err = r2, c2, nil
 			st.applyPlan(plan)
+			// 事件之外再落一份 span 属性：事件属性在 trace 列表和筛选里
+			// 不可见，只有 span 属性能回答「多少请求走了兜底」。
+			// 必须在 applyPlan 之后取 to_model，之前取 from_model。
+			obs.RecordFailover(span, "transport", failedModel, st.upstreamModel, 0)
 		}
 	}
 	if err != nil {
@@ -294,12 +299,18 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// 状态码层失败：响应头已到但正文一个字节都没下发，同样可以重试。
 	// 必须先读正文（用于上报）再关响应体归还连接。
 	if !st.failedOver && plan.shouldRetry(resp.StatusCode) {
+		// 先存下首次失败的状态码与模型：resp 与 st.upstreamModel 都会在
+		// 切换成功后被覆盖，之后再取只能拿到切换后的 200 和新模型名 ——
+		// 这正是看板上「429 查不到」的成因。
+		firstStatus := resp.StatusCode
+		failedModel := st.upstreamModel
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st, resp); ok {
 			resp.Body.Close()
 			cancel()
 			resp, cancel = r2, c2
 			st.applyPlan(plan)
 			obs.Add(ctx, st.mx.Failover, 1, st.metricAttrs("failover", resp.StatusCode))
+			obs.RecordFailover(span, "status", failedModel, st.upstreamModel, firstStatus)
 		}
 	}
 	defer cancel()

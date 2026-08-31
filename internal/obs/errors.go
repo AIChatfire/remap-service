@@ -46,7 +46,59 @@ const (
 	// "upstream connection failed"）。把两者并列上报，才能对照
 	// 「客户端报的 502」与「实际发生的 DNS 解析失败」。
 	AttrErrClientMsg = "gateway.error.client_message"
+
+	// 以下 failover 属性挂在**请求 span 上**（而非 attempt_failed 事件里）。
+	//
+	// 存在的理由：切换成功后 span 的 http.response.status_code 恒为最终的
+	// 200，首次失败的 429 只活在事件属性里。而 Logfire 的 trace 列表、
+	// Full Trace 视图、以及按属性筛选/聚合都只看 span 属性 —— 结果是
+	// 「今天有多少请求是被 429 顶掉后切换的」这个问题必须逐条展开事件
+	// 才能回答，等于不可查。这里把首次失败的状态码提到 span 上，
+	// 让它成为一等的筛选维度；事件仍保留正文等细节，两者不重复承载。
+	//
+	// AttrFailover 标记本次请求发生过故障切换。
+	AttrFailover = "gateway.failover"
+	// AttrFailoverStage 是首次失败发生的阶段（transport / status）。
+	AttrFailoverStage = "gateway.failover.stage"
+	// AttrFailoverStatus 是**首次失败**的上游状态码（如 429）。
+	// 与 http.response.status_code 刻意分开：后者是客户端实际收到的结果。
+	AttrFailoverStatus = "gateway.failover.first_status_code"
+	// AttrFailoverFrom 是切换前的上游模型名（真正出问题的那个）。
+	AttrFailoverFrom = "gateway.failover.from_model"
+	// AttrFailoverTo 是切换后实际承接请求的上游模型名。
+	AttrFailoverTo = "gateway.failover.to_model"
 )
+
+// RecordFailover 把「发生过故障切换」这件事落到请求 span 的属性上。
+//
+// 与 RecordAttemptFailure 的分工：后者用事件承载单次尝试的完整现场
+// （错误正文、Go 错误类型），可重复；本函数只在切换**成功**后调用一次，
+// 提供少量高价值、可聚合的维度。
+//
+// 同样不改 span 状态 —— 对客户端确实没故障，标红会污染 SLO。
+//
+// status <= 0 表示首次失败在传输层（没有状态码），此时不写状态码属性，
+// 避免看板上出现无意义的 0 值影响聚合。
+func RecordFailover(span trace.Span, stage, fromModel, toModel string, status int) {
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	attrs := make([]attribute.KeyValue, 0, 5)
+	attrs = append(attrs,
+		attribute.Bool(AttrFailover, true),
+		attribute.String(AttrFailoverStage, stage),
+	)
+	if status > 0 {
+		attrs = append(attrs, attribute.Int(AttrFailoverStatus, status))
+	}
+	if fromModel != "" {
+		attrs = append(attrs, attribute.String(AttrFailoverFrom, fromModel))
+	}
+	if toModel != "" {
+		attrs = append(attrs, attribute.String(AttrFailoverTo, toModel))
+	}
+	span.SetAttributes(attrs...)
+}
 
 // ErrorBodyLimit 报告允许上报的错误正文字节上限。
 func (p *Provider) ErrorBodyLimit() int {
