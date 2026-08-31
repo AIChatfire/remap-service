@@ -39,7 +39,9 @@ type Provider struct {
 
 	enabled     bool
 	logUpstream bool
-	excluded    []string
+	// errBodyBytes 是上报到 span 的上游错误正文上限，0 表示不上报。
+	errBodyBytes int
+	excluded     []string
 	// noopTracer 预先建好：排除路径上不能每次现场构造，否则省下的出网
 	// 开销又被分配吃掉。
 	noopTracer trace.Tracer
@@ -134,13 +136,14 @@ func (p *Provider) LogUpstreamModel() bool { return p != nil && p.logUpstream }
 // New 依据配置初始化可观测性。返回的 Provider 永远非 nil。
 func New(ctx context.Context, c config.Obs) (*Provider, error) {
 	p := &Provider{
-		Logger:      newLogger(c.LogLevel, c.LogFormat),
-		Tracer:      noop.NewTracerProvider().Tracer("remap-gateway"),
-		Metrics:     newNoopMetrics(),
-		enabled:     c.Enabled,
-		logUpstream: c.LogUpstreamModel,
-		excluded:    c.ExcludedURLs,
-		noopTracer:  noop.NewTracerProvider().Tracer(""),
+		Logger:       newLogger(c.LogLevel, c.LogFormat),
+		Tracer:       noop.NewTracerProvider().Tracer("remap-gateway"),
+		Metrics:      newNoopMetrics(),
+		enabled:      c.Enabled,
+		logUpstream:  c.LogUpstreamModel,
+		errBodyBytes: c.ErrorBodyBytes,
+		excluded:     c.ExcludedURLs,
+		noopTracer:   noop.NewTracerProvider().Tracer(""),
 	}
 
 	if !c.Enabled {

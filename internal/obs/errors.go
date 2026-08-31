@@ -1,0 +1,254 @@
+package obs
+
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"unicode/utf8"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// 错误相关的 span 属性键。集中在此，避免各处手写字符串导致看板筛选条件失配。
+const (
+	// AttrErrKind 是错误的粗分类，与指标里的 outcome 同源，便于两侧对照。
+	AttrErrKind = "gateway.error.kind"
+	// AttrErrBody 是上游错误正文的原始片段（未做任何结构化解析）。
+	AttrErrBody = "gateway.error.body"
+	// AttrErrBodySize 是错误正文的实际字节数。它与 AttrErrBody 的长度
+	// 不一致时说明发生了截断 —— 排查时能立刻知道看到的不是全文。
+	AttrErrBodySize = "gateway.error.body_size"
+	// AttrErrTruncated 标记正文是否被截断。
+	AttrErrTruncated = "gateway.error.truncated"
+	// AttrErrContentType 是错误响应的 Content-Type。上游返回 HTML 而非
+	// JSON 往往意味着请求根本没到上游应用层（被反代或 WAF 拦了）。
+	AttrErrContentType = "gateway.error.content_type"
+	// AttrErrDetail 是错误的完整原始描述。
+	//
+	// span 的 status 描述在 Logfire 列表里会被截短，且 exception 事件需要
+	// 展开才能看到；这个属性让「完整错误串」始终能被直接筛选与复制。
+	AttrErrDetail = "gateway.error.detail"
+	// AttrErrType 是 Go 侧的错误类型（如 *url.Error、*net.OpError）。
+	// 同一句 "connection refused" 出现在不同类型上，含义并不相同。
+	AttrErrType = "gateway.error.type"
+	// AttrErrCause 是错误链 unwrap 到底的根因。
+	//
+	// 传输层错误的 Error() 串是层层包裹的（*url.Error 包 *net.OpError 包
+	// *os.SyscallError），最外层只说"Post xxx 失败"，真正的原因
+	// （connection refused / TLS 握手失败 / no such host）在最里层。
+	AttrErrCause = "gateway.error.cause"
+	// AttrErrClientMsg 是实际返回给客户端的归类消息。
+	//
+	// 网关会把各种底层原因归一成少数几句对外消息（如统一的
+	// "upstream connection failed"）。把两者并列上报，才能对照
+	// 「客户端报的 502」与「实际发生的 DNS 解析失败」。
+	AttrErrClientMsg = "gateway.error.client_message"
+)
+
+// ErrorBodyLimit 报告允许上报的错误正文字节上限。
+func (p *Provider) ErrorBodyLimit() int {
+	if p == nil {
+		return 0
+	}
+	return p.errBodyBytes
+}
+
+// RecordError 把一个 Go 错误完整落到 span 上。
+//
+// 同时做三件事，缺一不可：
+//   - SetStatus(Error) 让 span 在看板上标红，参与错误率统计；
+//   - RecordError 生成 exception 事件，带上错误类型与完整 Error() 串。
+//     这是 OTel 里承载「详细错误信息」的标准位置，只 SetStatus 会让
+//     Logfire 的异常面板空着；
+//   - kind 属性给出粗分类，与指标的 outcome 标签对齐。
+//
+// 对 nil span、nil err 安全：调用方无需在每个错误分支上包 if。
+func RecordError(span trace.Span, kind string, err error) {
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	if kind != "" {
+		span.SetAttributes(attribute.String(AttrErrKind, kind))
+	}
+	if err == nil {
+		// 没有 Go error 的分支（配置缺失、请求被拒等）至少要让 kind 进
+		// 描述，否则 Logfire 上是一条没有任何文字说明的红 span。
+		span.SetStatus(codes.Error, kind)
+		return
+	}
+
+	msg := err.Error()
+	attrs := []attribute.KeyValue{
+		// 完整错误串独立成属性：status 描述会被看板截短，属性不会。
+		attribute.String(AttrErrDetail, msg),
+		attribute.String(AttrErrType, fmt.Sprintf("%T", err)),
+	}
+	// 根因与最外层不同才上报，避免给单层错误加一个重复字段。
+	if cause := rootCause(err); cause != "" && cause != msg {
+		attrs = append(attrs, attribute.String(AttrErrCause, cause))
+	}
+	span.SetAttributes(attrs...)
+
+	// WithStackTrace 关掉：错误来自上游 IO 或配置校验，栈指向的永远是
+	// 网关内部的转发点，对定位问题没有帮助，却让每个 span 多出几 KB。
+	span.RecordError(err)
+	span.SetStatus(codes.Error, msg)
+}
+
+// RecordGatewayError 记录网关自身产生的错误（非上游故障）。
+//
+// 这类分支的特点是「往往没有 Go error」：上游未配置、模型未映射、
+// 闸门拒绝等都是网关主动判定的失败。它们同样必须在看板上可见且带原因，
+// 否则客户端拿到 400/502/503，而 Logfire 上只有一条无说明的红 span，
+// 排查只能回去翻客户端日志。
+//
+// clientMsg 是返回给客户端的那句话，作为兜底的失败说明。
+// err 可为 nil。
+func RecordGatewayError(span trace.Span, kind, clientMsg string, err error) {
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	if clientMsg != "" {
+		span.SetAttributes(attribute.String(AttrErrClientMsg, clientMsg))
+	}
+	if err != nil {
+		RecordError(span, kind, err)
+		return
+	}
+	// 无 Go error：用对外消息当描述，它比 kind 更具体
+	// （"model `x` is not available" vs "unmapped_model"）。
+	if kind != "" {
+		span.SetAttributes(attribute.String(AttrErrKind, kind))
+	}
+	if clientMsg == "" {
+		clientMsg = kind
+	}
+	span.SetAttributes(attribute.String(AttrErrDetail, clientMsg))
+	span.SetStatus(codes.Error, clientMsg)
+}
+
+// RecordAttemptFailure 记录一次「失败但会被重试」的尝试。
+//
+// 与 RecordError 的关键区别：**不改 span 状态**。故障切换成功时整个请求
+// 是成功的，把 span 标红会让看板上出现大量假故障；但中间那次失败的原因
+// 必须留痕 —— 「为什么老在走兜底模型」只能从这里看出来，否则首次失败
+// 的原因（配额耗尽？该模型下线了？）被彻底丢弃。
+//
+// 用 span 事件而非属性承载：一次请求可能有多次尝试，属性会互相覆盖，
+// 事件天然可重复且带各自的时间戳。
+//
+// stage 说明失败发生在重试的哪一步（rewrite / build / transport / status），
+// 定位「切换本身没生效」时是第一手线索。
+func RecordAttemptFailure(span trace.Span, stage, model string, status int, err error) {
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	attrs := make([]attribute.KeyValue, 0, 6)
+	attrs = append(attrs, attribute.String("gateway.attempt.stage", stage))
+	if model != "" {
+		attrs = append(attrs, attribute.String("gateway.attempt.model", model))
+	}
+	if status > 0 {
+		attrs = append(attrs, attribute.Int("gateway.attempt.status_code", status))
+	}
+	if err != nil {
+		attrs = append(attrs,
+			attribute.String(AttrErrDetail, err.Error()),
+			attribute.String(AttrErrType, fmt.Sprintf("%T", err)),
+		)
+		if cause := rootCause(err); cause != "" && cause != err.Error() {
+			attrs = append(attrs, attribute.String(AttrErrCause, cause))
+		}
+	}
+	span.AddEvent("gateway.attempt_failed", trace.WithAttributes(attrs...))
+}
+
+// rootCause 把错误链 unwrap 到底，返回最内层错误的描述。
+//
+// 传输层错误在 Go 里是层层包裹的：*url.Error → *net.OpError →
+// *os.SyscallError → syscall.Errno。最外层只说明「哪个请求失败了」，
+// "connection refused" / "no such host" / TLS 证书错误都在最里层。
+func rootCause(err error) string {
+	for {
+		next := errors.Unwrap(err)
+		if next == nil {
+			return err.Error()
+		}
+		err = next
+	}
+}
+
+// RecordUpstreamError 把上游返回的错误响应完整落到 span 上。
+//
+// 与 RecordError 的区别：这里没有 Go error —— 连接是成功的，是上游
+// 应用层返回了 4xx/5xx。真正有诊断价值的信息全在响应正文里，所以正文
+// 按原样上报，不做字段提取。上游的错误结构各家不同（OpenAI 的
+// error.message、Anthropic 的 error.type、火山的 InvalidParameter），
+// 网关猜哪个字段重要必然会漏，把原文交给看板由人判断更可靠。
+//
+// body 超过 limit 时截断，并通过 AttrErrBodySize / AttrErrTruncated
+// 让看板上能看出「这不是全文」。limit <= 0 表示不上报正文。
+func RecordUpstreamError(span trace.Span, status int, contentType string, body []byte, limit int) {
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	span.SetAttributes(attribute.String(AttrErrKind, "upstream_status"))
+	frag := RecordErrorBody(span, contentType, body, limit)
+
+	msg := "upstream status " + strconv.Itoa(status)
+	if frag != "" {
+		// 正文进 status 描述而不只进属性：Logfire 的 trace 列表直接显示
+		// 描述，能不展开 span 就看到失败原因。
+		msg += ": " + frag
+	}
+	span.SetStatus(codes.Error, msg)
+}
+
+// RecordErrorBody 只把错误正文及其元信息落到 span，不改 span 状态。
+//
+// 供「已有 Go error 会另行 RecordError、但手上还握着一段上游正文」的
+// 场景使用（如读正文中途失败，已读前缀往往就是上游错误 JSON 的开头）。
+// 返回实际上报的片段，便于调用方拼进 status 描述；未上报时返回空串。
+func RecordErrorBody(span trace.Span, contentType string, body []byte, limit int) string {
+	if span == nil || !span.IsRecording() || len(body) == 0 {
+		return ""
+	}
+	attrs := make([]attribute.KeyValue, 0, 4)
+	attrs = append(attrs, attribute.Int(AttrErrBodySize, len(body)))
+	if contentType != "" {
+		attrs = append(attrs, attribute.String(AttrErrContentType, contentType))
+	}
+	var frag string
+	if limit > 0 {
+		var truncated bool
+		frag, truncated = truncateUTF8(body, limit)
+		attrs = append(attrs, attribute.String(AttrErrBody, frag))
+		if truncated {
+			attrs = append(attrs, attribute.Bool(AttrErrTruncated, true))
+		}
+	}
+	span.SetAttributes(attrs...)
+	return frag
+}
+
+// truncateUTF8 把 b 截到不超过 limit 字节，且不切断多字节字符。
+//
+// 直接 string(b[:limit]) 会在中文错误消息上切出半个字符，得到的属性值
+// 含替换符、在看板上显示为乱码。这里回退到最近的字符边界。
+func truncateUTF8(b []byte, limit int) (string, bool) {
+	if len(b) <= limit {
+		return string(b), false
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	// 整个窗口都在一个超长字符中间（异常输入）时按原长度切，
+	// 宁可留一个替换符也不要返回空串。
+	if cut == 0 {
+		cut = limit
+	}
+	return string(b[:cut]), true
+}

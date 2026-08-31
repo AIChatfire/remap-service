@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/betterme/remap-service/internal/config"
 	"github.com/betterme/remap-service/internal/obs"
@@ -23,6 +25,13 @@ import (
 )
 
 // --- 测试脚手架 ---
+
+// noopSpan 用于直接调用需要 span 的内部函数：这些用例只观察
+// 状态机结果，不校验上报内容，用无操作 span 避免搭建导出管道。
+func noopSpan() trace.Span {
+	_, s := noop.NewTracerProvider().Tracer("test").Start(context.Background(), "test")
+	return s
+}
 
 type capture struct {
 	mu     sync.Mutex
@@ -972,7 +981,7 @@ func TestMetricModelCardinalityBounded(t *testing.T) {
 				r.Header.Set(k, v)
 			}
 			body := []byte(`{"model":"` + c.model + `"}`)
-			if code := gw.rewrite(httptest.NewRecorder(), r, st, &body); code != 0 {
+			if code := gw.rewrite(httptest.NewRecorder(), r, st, &body, noopSpan()); code != 0 {
 				t.Fatalf("rewrite 返回 %d", code)
 			}
 			if st.metricModel != c.want {

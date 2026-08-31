@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
@@ -166,6 +165,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		st.outcome = "overloaded"
 		status := writeOverloaded(w, overloadRetryAfter)
+		// 过载是容量事件而非请求错误，但看板上必须能看出「这条 503 是
+		// 网关自己拒的，不是上游返回的」，并带上当时的在途水位。
+		cur, limit := g.InFlight()
+		span.SetAttributes(
+			attribute.Int("gateway.inflight", cur),
+			attribute.Int("gateway.inflight_limit", limit),
+		)
+		obs.RecordGatewayError(span, st.outcome,
+			"gateway at capacity; retry after "+strconv.Itoa(overloadRetryAfter)+"s", nil)
 		obs.Add(ctx, mx.Rejected, 1, st.metricAttrs(st.outcome, status))
 		g.log(st, status, r)
 		return
@@ -194,15 +202,17 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	base, ok := g.resolveBase(r, spec.Name)
 	if !ok {
 		st.outcome = "no_upstream"
-		return writeError(w, http.StatusBadGateway, "gateway_error",
-			"upstream base not configured; set UPSTREAM_BASE or send a valid "+BaseHeader+" header")
+		msg := "upstream base not configured; set UPSTREAM_BASE or send a valid " + BaseHeader + " header"
+		obs.RecordGatewayError(span, st.outcome, msg, nil)
+		return writeError(w, http.StatusBadGateway, "gateway_error", msg)
 	}
 
 	proxy, ok := g.resolveProxy(r)
 	if !ok {
 		st.outcome = "bad_proxy"
-		return writeError(w, http.StatusBadRequest, "invalid_request_error",
-			"invalid "+ProxyHeader+" header; expected a full URL with scheme http, https, socks5 or socks5h")
+		msg := "invalid " + ProxyHeader + " header; expected a full URL with scheme http, https, socks5 or socks5h"
+		obs.RecordGatewayError(span, st.outcome, msg, nil)
+		return writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 	}
 	if proxy != "" {
 		// 注入 ctx 而非改 Transport：buildRequest 与 client.Do 都派生自
@@ -217,13 +227,16 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	body, err := g.readBody(r)
 	if err != nil {
 		st.outcome, st.err = "bad_request", err
+		// 读请求体失败的原因（超限 / 客户端中途断开）只在 err 里，
+		// 不上报的话看板上就是一条没有说明的 400。
+		obs.RecordGatewayError(span, st.outcome, err.Error(), err)
 		return writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 	}
 	st.bytesIn = int64(len(body))
 
 	outBody := body
 	if len(body) > 0 && protocol.LooksLikeJSON(body) {
-		if code := g.rewrite(w, r, st, &outBody); code != 0 {
+		if code := g.rewrite(w, r, st, &outBody, span); code != 0 {
 			return code
 		}
 	}
@@ -240,6 +253,9 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	ureq, err := g.buildRequest(ctx, r, spec, base, outBody)
 	if err != nil {
 		st.outcome, st.err = "build_request_failed", err
+		// 对客户端只说"构造失败"，但看板必须拿到真正的原因
+		// （多为 base 拼接后 URL 非法），否则无法判断是配置问题。
+		obs.RecordGatewayError(span, st.outcome, "failed to build upstream request", err)
 		return writeError(w, http.StatusInternalServerError, "gateway_error", "failed to build upstream request")
 	}
 
@@ -251,6 +267,10 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// 连接层失败：还没有任何字节写给客户端，可以安全地换模型重试。
 	if err != nil && plan.enabled {
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st); ok {
+			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
+			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
+			// 完全不可见，上游某个模型静默挂掉也无人发现。
+			obs.RecordAttemptFailure(span, "transport", st.upstreamModel, 0, err)
 			resp, cancel, err = r2, c2, nil
 			st.applyPlan(plan)
 		}
@@ -258,8 +278,16 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	if err != nil {
 		st.outcome, st.err = "upstream_error", err
 		obs.Add(ctx, st.mx.UpstreamErr, 1, st.metricAttrs("transport", 0))
-		span.SetStatus(codes.Error, err.Error())
 		code, msg := classifyUpstreamError(ctx, err)
+		// 传输层失败没有响应正文，err 本身就是全部线索。RecordGatewayError
+		// 会落下完整错误串、Go 错误类型、unwrap 到底的根因，并生成
+		// exception 事件 —— 网关对客户端只说 "upstream connection failed"，
+		// 真正的 DNS/TLS/超时原因只能从这里看到。
+		//
+		// kind 用 st.outcome 而非另写一个字面量：指标侧的 "transport" 是
+		// 刻意区分传输层失败的维度，但 span 的 kind 必须与 outcome 同名，
+		// 否则按 outcome 筛 span 会整类漏掉。
+		obs.RecordGatewayError(span, st.outcome, msg, err)
 		return writeError(w, code, "upstream_error", msg)
 	}
 
@@ -267,6 +295,11 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// 注意必须先关掉首次响应体，否则连接无法归还连接池。
 	if !st.failedOver && plan.shouldRetry(resp.StatusCode) {
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st); ok {
+			// 被切掉的那次响应带着上游的真实拒绝原因（429 的配额说明、
+			// 503 的过载详情）。这里不读它的正文：连接要立刻归还连接池，
+			// 为一次已被替代的失败多读一次 IO 不值得。状态码 + 模型名
+			// 已足够回答「哪个模型在什么状态码上被切掉了」。
+			obs.RecordAttemptFailure(span, "status", st.upstreamModel, resp.StatusCode, nil)
 			resp.Body.Close()
 			cancel()
 			resp, cancel = r2, c2
@@ -289,7 +322,9 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	rep := g.replacerFor(st)
 	copyResponseHeaders(w.Header(), resp.Header, g.rules.DropHeaders())
 
-	if isSSE(resp) {
+	// 上游以 SSE 头返回错误状态时不能走流式转发：错误正文是普通 JSON
+	// 而非事件流，且它是排查的唯一线索。交给 pipeBuffered 读入并上报。
+	if isSSE(resp) && resp.StatusCode < 400 {
 		st.outcome = "stream"
 		return g.pipeStream(ctx, w, resp, spec, rep, st, span)
 	}
@@ -298,7 +333,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 }
 
 // rewrite 解析请求模型并改写为上游真实模型。返回非 0 表示已写出错误响应。
-func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, body *[]byte) int {
+func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, body *[]byte, span trace.Span) int {
 	pub, err := protocol.ExtractModel(*body)
 	if err != nil {
 		return 0 // 无 model 字段的请求（如部分工具类端点）直接透传
@@ -327,8 +362,11 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 		st.upstreamModel = up
 	case g.cfg.Mapping.Strict:
 		st.outcome = "unmapped_model"
-		return writeError(w, http.StatusBadRequest, "invalid_request_error",
-			"model `"+pub+"` is not available")
+		// 带上被拒的模型名：严格模式下这是最高频的 4xx，
+		// 看板上没有模型名就无法判断该补哪条映射。
+		msg := "model `" + pub + "` is not available"
+		obs.RecordGatewayError(span, st.outcome, msg, nil)
+		return writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 	default:
 		// 未命中任何规则时原样透传，保证网关对新模型零配置可用。
 		st.upstreamModel = pub
@@ -344,6 +382,9 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 	nb, err := protocol.RewriteModel(*body, st.upstreamModel)
 	if err != nil {
 		st.outcome, st.err = "rewrite_failed", err
+		// 改写失败意味着请求体形态超出预期（model 字段类型不对等），
+		// 对客户端只回一句通用错误，具体原因必须进看板。
+		obs.RecordGatewayError(span, st.outcome, "failed to rewrite request", err)
 		return writeError(w, http.StatusInternalServerError, "gateway_error", "failed to rewrite request")
 	}
 	*body = nb

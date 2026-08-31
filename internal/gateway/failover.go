@@ -4,8 +4,11 @@ import (
 	"context"
 	"net/http"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/betterme/remap-service/internal/capability"
 	"github.com/betterme/remap-service/internal/mapping"
+	"github.com/betterme/remap-service/internal/obs"
 	"github.com/betterme/remap-service/internal/protocol"
 )
 
@@ -163,12 +166,18 @@ func (g *Gateway) retryWithFallback(
 	ctx context.Context, r *http.Request, spec *protocol.Spec,
 	base string, body []byte, plan failoverPlan, st *state,
 ) (*http.Response, context.CancelFunc, bool) {
+	// 重试自身的失败必须留痕。调用方只看到 ok == false，随后回落到首次
+	// 失败的错误 —— 若这里静默返回，「切换为什么没生效」在看板上无迹可寻。
+	span := trace.SpanFromContext(ctx)
+
 	nb, err := protocol.RewriteModel(body, plan.model)
 	if err != nil {
+		obs.RecordAttemptFailure(span, "rewrite", plan.model, 0, err)
 		return nil, nil, false
 	}
 	ureq, err := g.buildRequest(ctx, r, spec, base, nb)
 	if err != nil {
+		obs.RecordAttemptFailure(span, "build", plan.model, 0, err)
 		return nil, nil, false
 	}
 	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
@@ -176,6 +185,7 @@ func (g *Gateway) retryWithFallback(
 		if cancel != nil {
 			cancel()
 		}
+		obs.RecordAttemptFailure(span, "transport", plan.model, 0, err)
 		return nil, nil, false
 	}
 	return resp, cancel, true

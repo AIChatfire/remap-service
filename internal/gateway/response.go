@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 
@@ -86,7 +85,11 @@ func (g *Gateway) pipeStream(
 
 		default:
 			st.outcome = "stream_broken"
-			span.SetStatus(codes.Error, err.Error())
+			// 中断位置由上面已上报的 gateway.sse.events / bytes 给出
+			// （它们就是中断时的计数），无需重复上报。
+			// RecordError 会带上完整错误串、Go 类型与 unwrap 后的根因 ——
+			// 流中断的真因（h2 RST_STREAM 码、TLS 断连）都在错误链里层。
+			obs.RecordError(span, st.outcome, err)
 			obs.Add(ctx, st.mx.UpstreamErr, 1, a)
 		}
 	}
@@ -103,7 +106,11 @@ func (g *Gateway) pipeBuffered(
 	needSanitize := g.cfg.SanitizeEnabled() && st.publicModel != ""
 
 	// 无需脱敏或响应过大：零拷贝直通。
-	if !needSanitize || (resp.ContentLength > 0 && resp.ContentLength > limit) {
+	//
+	// 例外：4xx/5xx 不走这条路。错误正文是排查的唯一线索，必须先读进内存
+	// 才能上报；且错误响应一定很小（各家上游的错误 JSON 都在几百字节内），
+	// 缓冲它不构成内存风险 —— 真正需要防的是正常响应的大 body。
+	if resp.StatusCode < 400 && (!needSanitize || (resp.ContentLength > 0 && resp.ContentLength > limit)) {
 		if resp.ContentLength >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 		}
@@ -112,6 +119,7 @@ func (g *Gateway) pipeBuffered(
 		st.bytesOut = n
 		if err != nil {
 			st.err = err
+			obs.RecordError(span, "write_client_failed", err)
 		}
 		obs.Add(ctx, st.mx.BytesOut, n, st.metricAttrs(st.outcome, resp.StatusCode))
 		return resp.StatusCode
@@ -121,7 +129,14 @@ func (g *Gateway) pipeBuffered(
 	if err != nil {
 		st.err = err
 		st.outcome = "read_upstream_failed"
-		span.SetStatus(codes.Error, err.Error())
+		// 读上游正文中断：io.ReadAll 出错时仍返回已读到的部分，据实上报
+		// 字节数以区分「一个字节没来」（多为上游拒连）和「读到一半断了」
+		// （多为链路中断）。已读前缀本身也常含上游的错误 JSON 开头。
+		span.SetAttributes(attribute.Int("gateway.upstream.read_bytes", len(body)))
+		if len(body) > 0 {
+			obs.RecordErrorBody(span, resp.Header.Get("Content-Type"), body, g.o.ErrorBodyLimit())
+		}
+		obs.RecordError(span, st.outcome, err)
 		return writeError(w, http.StatusBadGateway, "upstream_error", "failed to read upstream response")
 	}
 	if int64(len(body)) > limit {
@@ -131,11 +146,20 @@ func (g *Gateway) pipeBuffered(
 		n2, _ := io.Copy(w, resp.Body)
 		st.bytesOut = int64(n1) + n2
 		st.outcome = "sanitize_skipped_too_large"
+		if resp.StatusCode >= 400 {
+			// 错误正文超过 MAX_SANITIZE_BYTES 属异常形态（通常是上游把
+			// 整个请求回显了）。只上报已读到的前缀，且明确标注未脱敏，
+			// 因为这条路径本身就是放弃脱敏的直通。
+			g.recordUpstreamStatus(resp, body, st, span, false)
+		}
 		return resp.StatusCode
 	}
 
+	// needSanitize 必须重新判断：4xx/5xx 会绕过上面的直通分支走到这里，
+	// 此时 rep 可能为 nil（脱敏关闭或请求无 model 字段），无条件调用
+	// Sanitize 等于在关闭脱敏的部署里悄悄启用它。
 	out := body
-	if protocol.LooksLikeJSON(body) {
+	if needSanitize && protocol.LooksLikeJSON(body) {
 		if nb, changed := spec.Sanitize(body, st.publicModel, rep); changed {
 			out = nb
 			st.rewrites++
@@ -154,9 +178,57 @@ func (g *Gateway) pipeBuffered(
 	obs.Add(ctx, st.mx.BytesOut, int64(n), a)
 	obs.Add(ctx, st.mx.Rewrites, st.rewrites, a)
 	if resp.StatusCode >= 400 {
-		span.SetStatus(codes.Error, "upstream status "+strconv.Itoa(resp.StatusCode))
+		// 上报脱敏后的 out 而非原始 body：错误正文里同样可能出现上游真实
+		// 模型名（"model xxx not found" 是最常见的一类错误），上报原文
+		// 等于绕过脱敏把上游形态泄漏进看板。
+		g.recordUpstreamStatus(resp, out, st, span, needSanitize)
 	}
 	return resp.StatusCode
+}
+
+// recordUpstreamStatus 把上游的错误响应（状态码 + 正文 + 关键头）落到 span。
+//
+// 上游报错时，状态码只说明「失败了」，正文才说明「为什么」。各家上游的
+// 错误结构互不相同，网关不做字段提取、原样上报，由看板侧判断。
+//
+// 额外单独提取 request_id 与 retry-after：前者是找上游对账的唯一凭据，
+// 后者决定客户端该等多久，两者都值得成为可直接筛选的属性。
+// sanitized 为 false 表示正文未过脱敏（超限直通路径），此时正文可能含上游
+// 真实模型名 —— 看板上必须能把这类记录筛出来，否则会误以为所有上报正文
+// 都已脱敏。
+func (g *Gateway) recordUpstreamStatus(resp *http.Response, body []byte, st *state, span trace.Span, sanitized bool) {
+	if id := upstreamRequestID(resp.Header); id != "" {
+		span.SetAttributes(attribute.String("gateway.upstream.request_id", id))
+	}
+	if !sanitized {
+		span.SetAttributes(attribute.Bool("gateway.error.body_sanitized", false))
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		span.SetAttributes(attribute.String("http.response.retry_after", ra))
+	}
+	obs.RecordUpstreamError(span, resp.StatusCode,
+		resp.Header.Get("Content-Type"), body, g.o.ErrorBodyLimit())
+}
+
+// upstreamRequestID 从响应头里找上游的请求标识。
+//
+// 各家用的头名不同，按常见程度排列取第一个非空：出错找上游对账时，
+// 这个 ID 是唯一能让对方定位到同一次调用的凭据。
+var requestIDHeaders = []string{
+	"X-Request-Id",     // OpenAI、多数网关
+	"Request-Id",       // Anthropic
+	"X-Amzn-Requestid", // Bedrock
+	"X-Ms-Request-Id",  // Azure OpenAI
+	"X-Tt-Logid",       // 火山方舟
+}
+
+func upstreamRequestID(h http.Header) string {
+	for _, k := range requestIDHeaders {
+		if v := h.Get(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // isClientGone 判断错误是否源于客户端提前离开（主动取消或连接被关闭），

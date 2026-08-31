@@ -123,6 +123,17 @@ type Obs struct {
 	LogFormat        string
 	LogUpstreamModel bool
 
+	// ErrorBodyBytes 是上报到 span 的上游错误正文上限（字节）。
+	//
+	// 上游报错时真正有用的信息全在正文里（message / type / code /
+	// request_id），只记状态码等于把「为什么失败」丢掉，看板上只能看到
+	// 一个 502，排查还得回去翻客户端日志。这里把原始正文按原样带上。
+	//
+	// 有上限是因为错误正文并非总是紧凑 JSON：反代打回的 HTML 错误页、
+	// 上游把整个请求回显进错误的情况都可能达到几百 KB，无节制上报会
+	// 撑爆单个 span 并拖慢出网。0 表示不上报正文（只留状态码与分类）。
+	ErrorBodyBytes int
+
 	// ExcludedURLs 是不产生 trace 与指标的路径关键字（ASCII 大小写无关的子串匹配）。
 	//
 	// 健康检查、就绪探针、心跳这类轮询请求的频率往往比真实业务高一个数量级，
@@ -196,8 +207,12 @@ func Load(envFile string) (*Config, error) {
 			LogLevel:         envStr("LOG_LEVEL", "info"),
 			LogFormat:        envStr("LOG_FORMAT", "json"),
 			LogUpstreamModel: envBool("LOG_UPSTREAM_MODEL", true),
-			ExcludedURLs:     envList("EXCLUDED_URLS"),
-			MetricInterval:   envDur("OBS_METRIC_INTERVAL", 60*time.Second),
+			// 用 AllowZero：0 是「不上报正文」的有效取值，不是未设置。
+			// 8KiB 足以容纳各家上游的错误 JSON，又不至于让偶发的 HTML
+			// 错误页把 span 撑大。
+			ErrorBodyBytes: envIntAllowZero("OBS_ERROR_BODY_BYTES", 8<<10),
+			ExcludedURLs:   envList("EXCLUDED_URLS"),
+			MetricInterval: envDur("OBS_METRIC_INTERVAL", 60*time.Second),
 			// 用 AllowZero：0 是「只信 RemoteAddr」的有效取值，不是未设置。
 			TrustedProxyHops: envIntAllowZero("TRUSTED_PROXY_HOPS", 0),
 		},
