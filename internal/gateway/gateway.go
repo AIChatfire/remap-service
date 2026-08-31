@@ -261,6 +261,10 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	plan := g.planFailover(r, st)
 
+	// 路由确定后立即写入上游路径 span 属性，确保在 trace 列表可见。
+	// 不能等到失败或 RecordAttemptFailure 才写 —— 成功请求的上游路径也需要可筛选。
+	span.SetAttributes(attribute.String(obs.AttrUpstreamPath, ureq.URL.Path))
+
 	sendAt := time.Now()
 	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
 
@@ -336,6 +340,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 		st.metricAttrs("ok", resp.StatusCode))
 	span.SetAttributes(
 		attribute.Int("http.response.status_code", resp.StatusCode),
+		attribute.Int(obs.AttrUpstreamStatus, resp.StatusCode),
 		attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
 	)
 

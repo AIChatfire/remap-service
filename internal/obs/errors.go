@@ -86,6 +86,16 @@ const (
 	// Logfire 的 HTTP Request Attributes 面板会显示上游路径，
 	// 等于伪造了客户端请求的事实。两者必须并存才能看出重写前后。
 	AttrUpstreamPath = "gateway.upstream.path"
+
+	// AttrUpstreamStatus 是**上游**返回的 HTTP 状态码（含 failover 与非 failover 场景）。
+	//
+	// 与 http.response.status_code 刻意分开：后者是客户端实际收到的最终状态码，
+	// failover 成功时它是 200；前者始终记录上游的真实响应，429/503 等失败状态码
+	// 才能在 trace 列表直接筛选，不必逐条展开事件。
+	//
+	// 与 AttrFailoverStatus 的分工：那个只在 failover 触发时写入，记录首次失败；
+	// 本键在所有上游响应（成功或失败）后都写入，是更通用的诊断维度。
+	AttrUpstreamStatus = "gateway.upstream.status_code"
 )
 
 // RecordFailover 把「发生过故障切换」这件事落到请求 span 的属性上。

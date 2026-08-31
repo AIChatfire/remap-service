@@ -50,6 +50,16 @@ func TestUpstreamErrorBodyReachesSpan(t *testing.T) {
 	if ct := attrString(span, "gateway.error.content_type"); ct != "application/json" {
 		t.Errorf("content_type 应为 application/json，实际 %q", ct)
 	}
+
+	// 新增校验：gateway.upstream.status_code 应记录上游的 429
+	if got := attrInt(span, "gateway.upstream.status_code"); got != http.StatusTooManyRequests {
+		t.Errorf("gateway.upstream.status_code 应为 429，实际 %d", got)
+	}
+
+	// 新增校验：gateway.upstream.path 应在 span 属性中
+	if path := attrString(span, "gateway.upstream.path"); path == "" {
+		t.Error("gateway.upstream.path 应在 span 属性中，实际为空")
+	}
 }
 
 // 上游返回 HTML（常见于被反向代理/WAF 拦截）时同样要如实上报，

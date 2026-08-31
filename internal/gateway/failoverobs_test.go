@@ -80,6 +80,16 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 		t.Errorf("最终状态码应保持 200，实际 %d", got)
 	}
 
+	// 新增校验：gateway.upstream.status_code 应与最终状态码一致（切换成功后为 200）
+	if got := attrInt(sp, "gateway.upstream.status_code"); got != http.StatusOK {
+		t.Errorf("gateway.upstream.status_code 应为最终的 200，实际 %d", got)
+	}
+
+	// 新增校验：gateway.upstream.path 应在 span 属性中可见
+	if path := attrString(sp, "gateway.upstream.path"); path == "" {
+		t.Error("gateway.upstream.path 不应为空，必须在 span 属性中")
+	}
+
 	// 关键断言：整个 span 不得为 Error。
 	for _, s := range sr.Ended() {
 		if s.Status().Code == codes.Error {
