@@ -2,6 +2,7 @@ package obs
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"strings"
@@ -266,6 +267,104 @@ func TestRecordErrorNilSafe(t *testing.T) {
 	// 没有 Go error 时，kind 至少要进描述。
 	if s.Status().Description != "no_upstream" {
 		t.Errorf("nil error 时描述应回落到 kind，实际 %q", s.Status().Description)
+	}
+}
+
+// attrErr 是一个自带结构化字段的错误，模拟 upstream.TimeoutError。
+// 用本地类型而非 import upstream：obs 是被 upstream 依赖的底层包，
+// 反向 import 会成环 —— 这也正是 AttrProvider 用接口的原因。
+type attrErr struct {
+	msg   string
+	attrs map[string]string
+}
+
+func (e *attrErr) Error() string            { return e.msg }
+func (e *attrErr) Attrs() map[string]string { return e.attrs }
+
+// 实现 AttrProvider 的错误，其字段必须原样落到 span 属性。
+// 这是「超时只有一句 context deadline exceeded」的正面修复验证。
+func TestStructuredAttrsRecorded(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	RecordError(span, "upstream_error", &attrErr{
+		msg: "upstream first_byte timeout after 30.1s (limit 30s)",
+		attrs: map[string]string{
+			"gateway.timeout.kind":       "first_byte",
+			"gateway.timeout.limit_ms":   "30000",
+			"gateway.timeout.elapsed_ms": "30123",
+		},
+	})
+	s := done()
+
+	for k, want := range map[string]string{
+		"gateway.timeout.kind":       "first_byte",
+		"gateway.timeout.limit_ms":   "30000",
+		"gateway.timeout.elapsed_ms": "30123",
+	} {
+		v, ok := attrOf(t, s, k)
+		if !ok {
+			t.Errorf("缺少结构化属性 %s，看板无法按该维度聚合", k)
+			continue
+		}
+		if v.AsString() != want {
+			t.Errorf("%s = %q, want %q", k, v.AsString(), want)
+		}
+	}
+	// 结构化字段不能取代完整错误串，两者用途不同。
+	if v, ok := attrOf(t, s, AttrErrDetail); !ok || !strings.Contains(v.AsString(), "first_byte") {
+		t.Error("完整错误串仍必须上报")
+	}
+}
+
+// 被包裹在错误链深处的 AttrProvider 也要能取到：网关侧可能再包一层。
+func TestStructuredAttrsThroughWrap(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	inner := &attrErr{msg: "boom", attrs: map[string]string{"gateway.timeout.kind": "total"}}
+	RecordError(span, "upstream_error", fmt.Errorf("dial failed: %w", inner))
+	s := done()
+
+	v, ok := attrOf(t, s, "gateway.timeout.kind")
+	if !ok || v.AsString() != "total" {
+		t.Errorf("包裹后丢失结构化字段: ok=%v v=%v", ok, v)
+	}
+}
+
+// failover 的中间失败事件也要带结构化字段，否则「为什么老在切换」
+// 只能看到一句无信息的超时。
+func TestAttemptFailureCarriesStructuredAttrs(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	RecordAttemptFailure(span, "transport", "m-up", 0, &attrErr{
+		msg:   "timeout",
+		attrs: map[string]string{"gateway.timeout.kind": "first_byte"},
+	})
+	s := done()
+
+	if len(s.Events()) != 1 {
+		t.Fatalf("期望 1 个事件，实际 %d", len(s.Events()))
+	}
+	var found bool
+	for _, kv := range s.Events()[0].Attributes {
+		if string(kv.Key) == "gateway.timeout.kind" && kv.Value.AsString() == "first_byte" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("attempt_failed 事件缺少结构化字段")
+	}
+	// 中间失败不改 span 状态，这条约束不能被本次改动破坏。
+	if s.Status().Code == codes.Error {
+		t.Error("中间失败不应标红 span，会污染 SLO")
+	}
+}
+
+// 不实现 AttrProvider 的普通错误不应产生任何多余属性。
+func TestPlainErrorNoExtraAttrs(t *testing.T) {
+	span, done := newRecordedSpan(t)
+	RecordError(span, "k", errors.New("plain"))
+	s := done()
+	for _, kv := range s.Attributes() {
+		if strings.HasPrefix(string(kv.Key), "gateway.timeout.") {
+			t.Errorf("普通错误不应带 timeout 字段: %s", kv.Key)
+		}
 	}
 }
 

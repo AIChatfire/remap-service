@@ -11,6 +11,7 @@ package upstream
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -122,6 +123,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request, stream bool) (*http.
 		total = maxDur(c.totalTimeout, 30*time.Minute)
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, total)
+	start := time.Now()
 
 	var settled atomic.Bool
 	timer := time.AfterFunc(c.firstByteTimeout, func() {
@@ -138,15 +140,51 @@ func (c *Client) Do(ctx context.Context, req *http.Request, stream bool) (*http.
 		if resp != nil {
 			resp.Body.Close()
 		}
-		return nil, func() {}, context.DeadlineExceeded
+		// 不返回裸的 context.DeadlineExceeded：它是全局单例，落到看板上
+		// 只有一句 "context deadline exceeded"，看不出超的是首字节还是
+		// 总时长、阈值多少、哪个上游。这些信息此刻全在手上。
+		return nil, func() {}, &TimeoutError{
+			Kind:    TimeoutKindFirstByte,
+			Limit:   c.firstByteTimeout,
+			Elapsed: time.Since(start),
+			URL:     safeURL(req.URL),
+			Stream:  stream,
+		}
 	}
 	timer.Stop()
 
 	if err != nil {
 		cancel()
-		return nil, func() {}, err
+		return nil, func() {}, c.describe(err, req, start, total, stream)
 	}
 	return resp, cancel, nil
+}
+
+// describe 给传输层错误补上上下文。
+//
+// 只对超时做加工：*url.Error 已经带上了方法与 URL，而 deadline 类错误
+// 的最内层是无信息的哨兵值，必须由这里补出阈值与耗时。
+//
+// 区分两种 deadline 来源：本客户端设的总超时，与调用方 ctx 自带的 deadline
+// （父 ctx 更早到期时）。后者的 Limit 记为实际耗时，避免上报一个
+// 与现场不符的阈值把排查引向网关配置。
+func (c *Client) describe(err error, req *http.Request, start time.Time, total time.Duration, stream bool) error {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	elapsed := time.Since(start)
+	limit := total
+	if elapsed < total {
+		// 没到本客户端的上限就超时了，说明 deadline 来自父 ctx。
+		limit = elapsed
+	}
+	return &TimeoutError{
+		Kind:    TimeoutKindTotal,
+		Limit:   limit,
+		Elapsed: elapsed,
+		URL:     safeURL(req.URL),
+		Stream:  stream,
+	}
 }
 
 func orDur(v, def time.Duration) time.Duration {

@@ -3,6 +3,7 @@ package obs
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"unicode/utf8"
 
@@ -89,6 +90,7 @@ func RecordError(span trace.Span, kind string, err error) {
 	if cause := rootCause(err); cause != "" && cause != msg {
 		attrs = append(attrs, attribute.String(AttrErrCause, cause))
 	}
+	attrs = append(attrs, structuredAttrs(err)...)
 	span.SetAttributes(attrs...)
 
 	// WithStackTrace 关掉：错误来自上游 IO 或配置校验，栈指向的永远是
@@ -161,8 +163,50 @@ func RecordAttemptFailure(span trace.Span, stage, model string, status int, err 
 		if cause := rootCause(err); cause != "" && cause != err.Error() {
 			attrs = append(attrs, attribute.String(AttrErrCause, cause))
 		}
+		attrs = append(attrs, structuredAttrs(err)...)
 	}
 	span.AddEvent("gateway.attempt_failed", trace.WithAttributes(attrs...))
+}
+
+// AttrProvider 由「自身携带结构化诊断字段」的错误类型实现。
+//
+// 用接口而非在 obs 里按具体类型分支：obs 是被 gateway、upstream 共同依赖的
+// 底层包，反向 import 会成环。任何错误类型只要实现 Attrs() 就能把自己的
+// 字段带上看板，无需改动这里。
+//
+// 键名由错误类型自己决定 —— 它才知道自己的字段该怎么命名，
+// 在这里做映射等于把命名知识分散到两个包。
+type AttrProvider interface {
+	Attrs() map[string]string
+}
+
+// structuredAttrs 沿错误链找第一个 AttrProvider，取其结构化字段。
+//
+// 只取第一个：错误链上出现多个实现时，最外层离故障现场最近。
+//
+// 存在的价值在于把「字符串里的信息」变成「可聚合的维度」。超时错误的
+// Error() 串里虽然也有阈值和耗时，但看板无法对字符串做
+// 「按 kind 分组、按 elapsed 排序」这类操作。
+func structuredAttrs(err error) []attribute.KeyValue {
+	var ap AttrProvider
+	if !errors.As(err, &ap) {
+		return nil
+	}
+	m := ap.Attrs()
+	if len(m) == 0 {
+		return nil
+	}
+	// 键排序后输出：属性顺序稳定，测试与看板对照时不会随 map 遍历漂移。
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	attrs := make([]attribute.KeyValue, 0, len(keys))
+	for _, k := range keys {
+		attrs = append(attrs, attribute.String(k, m[k]))
+	}
+	return attrs
 }
 
 // rootCause 把错误链 unwrap 到底，返回最内层错误的描述。
