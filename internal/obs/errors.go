@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -96,6 +97,20 @@ const (
 	// 与 AttrFailoverStatus 的分工：那个只在 failover 触发时写入，记录首次失败；
 	// 本键在所有上游响应（成功或失败）后都写入，是更通用的诊断维度。
 	AttrUpstreamStatus = "gateway.upstream.status_code"
+
+	// AttrLogfireMsg 覆盖 Logfire 列表里那一行渲染出来的文案。
+	//
+	// 这是「429 在看板上查不到」的真正成因：Logfire 的 Message 列不读
+	// 自定义属性，只渲染本键，缺失时才回落 span name 并自动追加
+	// http.response.status_code —— 于是 failover 成功的请求恒显示
+	// "gateway /v1/chat/completions → 200"，而事件行只有静态事件名
+	// "gateway.attempt_failed"，上游路径与真实状态码全都不出现在列表上。
+	// 加 span 属性解决的是「能不能筛」，本键解决的是「扫一眼能不能看见」，
+	// 两者互不替代。
+	//
+	// 只在信息确实与 span name 不同时才写（failover、上游失败），
+	// 正常请求不写 —— 与默认渲染一致的字符串是纯浪费。
+	AttrLogfireMsg = "logfire.msg"
 )
 
 // RecordFailover 把「发生过故障切换」这件事落到请求 span 的属性上。
@@ -156,6 +171,45 @@ func recordFailover(span trace.Span, stage, fromModel, toModel string, status in
 		attrs = append(attrs, attribute.String(AttrFailoverTo, toModel))
 	}
 	span.SetAttributes(attrs...)
+}
+
+// SetRequestMsg 改写请求 span 在 Logfire 列表里显示的那一行文案。
+//
+// 默认渲染只有 span name + 客户端最终状态码，于是「上游 429 被切换后返回
+// 200」在列表上与一次普通成功完全同形，必须点开事件才知道发生过什么。
+// 这里把上游真实路径与真实状态码补进那一行：
+//
+//	gateway /v1/chat/completions → 200 (upstream /api/v3/chat/completions → 429)
+//
+// upstreamStatus <= 0 或与 clientStatus 相同且路径也无差异时不写 —— 那种
+// 情况默认渲染已经足够，多写一个属性只是浪费带宽。
+func SetRequestMsg(span trace.Span, route, upstreamPath string, clientStatus, upstreamStatus int) {
+	if span == nil || !span.IsRecording() {
+		return
+	}
+	sameStatus := upstreamStatus <= 0 || upstreamStatus == clientStatus
+	samePath := upstreamPath == "" || upstreamPath == route
+	if sameStatus && samePath {
+		return
+	}
+
+	var b strings.Builder
+	b.Grow(len(route) + len(upstreamPath) + 48)
+	b.WriteString("gateway ")
+	b.WriteString(route)
+	b.WriteString(" → ")
+	b.WriteString(strconv.Itoa(clientStatus))
+	b.WriteString(" (upstream")
+	if !samePath {
+		b.WriteByte(' ')
+		b.WriteString(upstreamPath)
+	}
+	if !sameStatus {
+		b.WriteString(" → ")
+		b.WriteString(strconv.Itoa(upstreamStatus))
+	}
+	b.WriteByte(')')
+	span.SetAttributes(attribute.String(AttrLogfireMsg, b.String()))
 }
 
 // ErrorBodyLimit 报告允许上报的错误正文字节上限。
@@ -265,7 +319,8 @@ func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status 
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	attrs := make([]attribute.KeyValue, 0, 10)
+	// 容量含末尾的 logfire.msg，少算一个就会在失败路径上多一次切片扩容。
+	attrs := make([]attribute.KeyValue, 0, 11)
 	attrs = append(attrs, attribute.String("gateway.attempt.stage", stage))
 	if model != "" {
 		attrs = append(attrs, attribute.String("gateway.attempt.model", model))
@@ -306,7 +361,38 @@ func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status 
 		}
 	}
 
+	// 事件名是静态的，Logfire 列表里那一行只会显示 "gateway.attempt_failed"，
+	// 路径与状态码都得展开属性才看得到。写 logfire.msg 让这一行自解释：
+	//   gateway.attempt_failed status /api/v3/chat/completions → 429 (deepseek-v4)
+	attrs = append(attrs, attribute.String(AttrLogfireMsg,
+		attemptMsg(stage, model, urlPath, status)))
+
 	span.AddEvent("gateway.attempt_failed", trace.WithAttributes(attrs...))
+}
+
+// attemptMsg 拼出失败尝试在列表里显示的一行文案。
+//
+// 手工拼接而不用 fmt.Sprintf：这是每次上游失败都会走的路径，
+// strconv + 预分配 Builder 无反射开销，且失败分支本就不该再加成本。
+func attemptMsg(stage, model, urlPath string, status int) string {
+	var b strings.Builder
+	b.Grow(len(stage) + len(urlPath) + len(model) + 40)
+	b.WriteString("gateway.attempt_failed ")
+	b.WriteString(stage)
+	if urlPath != "" {
+		b.WriteByte(' ')
+		b.WriteString(urlPath)
+	}
+	if status > 0 {
+		b.WriteString(" → ")
+		b.WriteString(strconv.Itoa(status))
+	}
+	if model != "" {
+		b.WriteString(" (")
+		b.WriteString(model)
+		b.WriteByte(')')
+	}
+	return b.String()
 }
 
 // AttrProvider 由「自身携带结构化诊断字段」的错误类型实现。

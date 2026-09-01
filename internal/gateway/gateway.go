@@ -263,7 +263,13 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 
 	// 路由确定后立即写入上游路径 span 属性，确保在 trace 列表可见。
 	// 不能等到失败或 RecordAttemptFailure 才写 —— 成功请求的上游路径也需要可筛选。
-	span.SetAttributes(attribute.String(obs.AttrUpstreamPath, ureq.URL.Path))
+	upstreamPath := ureq.URL.Path
+	span.SetAttributes(attribute.String(obs.AttrUpstreamPath, upstreamPath))
+
+	// upstreamStatus 记录上游**真实**返回的状态码，与客户端最终收到的
+	// http.response.status_code 分开：状态码层 failover 成功后，后者是 200，
+	// 而真正发生的是 429。0 表示尚未发生过切换。
+	var upstreamStatus int
 
 	sendAt := time.Now()
 	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
@@ -327,17 +333,14 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			// 在此处判断，判据集中在 obs 侧，避免两个调用点各写一套。
 			obs.RecordFailover(span, "status", failedModel, st.upstreamModel,
 				firstStatus, resp.StatusCode)
-			// 立即写入首次失败状态码到 gateway.upstream.status_code，
-			// 确保即使切换成功（最终 200），看板仍能直接看到首次的 429。
-			// 这与后续 340 行写入切换后状态码不冲突 —— 后者会被这里覆盖。
-			span.SetAttributes(attribute.Int(obs.AttrUpstreamStatus, firstStatus))
 		} else {
 			// 重试请求没发出去（改写/构造/连接失败），是网关侧问题，
 			// 排查方向与「备用模型也挂」完全不同，需单独一种 outcome。
 			obs.RecordFailoverAborted(span, "status", failedModel, firstStatus)
-			// 同样写入首次失败状态码
-			span.SetAttributes(attribute.Int(obs.AttrUpstreamStatus, firstStatus))
 		}
+		// 无论切换成功与否，上游真实状态码都是首次那个 429/503 ——
+		// 切换成功时 resp.StatusCode 已是 200，此处不记就永久丢失。
+		upstreamStatus = firstStatus
 	}
 	defer cancel()
 	defer resp.Body.Close()
@@ -346,21 +349,20 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	obs.Record(ctx, st.mx.TTFB, float64(st.ttfb.Microseconds())/1000.0,
 		st.metricAttrs("ok", resp.StatusCode))
 
-	// 只在非 failover 场景才写入最终状态码 —— failover 场景已在上面写过首次失败状态码。
-	// 避免用切换后的 200 覆盖掉诊断价值更高的首次失败 429。
-	if !st.failedOver {
-		span.SetAttributes(
-			attribute.Int("http.response.status_code", resp.StatusCode),
-			attribute.Int(obs.AttrUpstreamStatus, resp.StatusCode),
-			attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
-		)
-	} else {
-		// failover 场景只写客户端收到的最终状态码与 ttfb，upstream.status_code 已写过
-		span.SetAttributes(
-			attribute.Int("http.response.status_code", resp.StatusCode),
-			attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
-		)
+	// upstreamStatus 仅在发生过状态码层重试时被赋值（那时它是首次失败的
+	// 429/503）。未赋值说明没切换过，上游状态码就是当前响应的状态码。
+	// 收成单一写入点：此前分两个分支写同一组属性，改一处漏一处。
+	if upstreamStatus == 0 {
+		upstreamStatus = resp.StatusCode
 	}
+	span.SetAttributes(
+		attribute.Int("http.response.status_code", resp.StatusCode),
+		attribute.Int(obs.AttrUpstreamStatus, upstreamStatus),
+		attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
+	)
+	// 列表那一行默认只显示 span name + 最终状态码，上游 429 被切换成 200 后
+	// 与普通成功完全同形。把上游真实路径与状态码补进文案，扫一眼即可辨识。
+	obs.SetRequestMsg(span, st.route, upstreamPath, resp.StatusCode, upstreamStatus)
 
 	// ---------- 4. 响应脱敏并回写 ----------
 	rep := g.replacerFor(st)

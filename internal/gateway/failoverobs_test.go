@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -89,6 +90,39 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 	// 新增校验：gateway.upstream.path 应在 span 属性中可见
 	if path := attrString(sp, "gateway.upstream.path"); path == "" {
 		t.Error("gateway.upstream.path 不应为空，必须在 span 属性中")
+	}
+
+	// span 属性解决「能不能筛」，logfire.msg 解决「扫一眼能不能看见」。
+	//
+	// Logfire 的 Message 列不读自定义属性：缺 logfire.msg 时这一行恒为
+	// span name + 客户端最终状态码，于是「上游 429 被切成 200」在列表上
+	// 与一次普通成功完全同形。上面那些 attrInt 断言全过、看板依旧看不见
+	// 429 —— 正是用户反复提同一诉求的原因，所以这条断言不可省。
+	msg := attrString(sp, "logfire.msg")
+	if msg == "" {
+		t.Fatal("请求 span 缺少 logfire.msg，Logfire 列表行仍只显示最终 200")
+	}
+	if !strings.Contains(msg, "429") {
+		t.Errorf("logfire.msg 必须带上游真实状态码 429，实际 %q", msg)
+	}
+	if !strings.Contains(msg, "upstream") {
+		t.Errorf("logfire.msg 应标明 429 来自上游而非客户端结果，实际 %q", msg)
+	}
+	// 客户端实际收到的 200 也要留在文案里，否则读这一行的人会误判请求失败。
+	if !strings.Contains(msg, "200") {
+		t.Errorf("logfire.msg 应同时保留客户端最终状态码 200，实际 %q", msg)
+	}
+
+	// 事件行同理：默认只渲染静态事件名 gateway.attempt_failed，
+	// 哪个 stage、打到哪个上游端点、被哪个模型 429 全都不在列表上。
+	evMsg := eventString(ev, "logfire.msg")
+	if evMsg == "" {
+		t.Fatal("attempt 事件缺少 logfire.msg，列表上只剩静态事件名")
+	}
+	for _, want := range []string{"status", "429", "primary-up"} {
+		if !strings.Contains(evMsg, want) {
+			t.Errorf("事件 logfire.msg 应含 %q，实际 %q", want, evMsg)
+		}
 	}
 
 	// 关键断言：整个 span 不得为 Error。
