@@ -148,9 +148,8 @@ func (g *Gateway) pipeBuffered(
 		st.outcome = "sanitize_skipped_too_large"
 		if resp.StatusCode >= 400 {
 			// 错误正文超过 MAX_SANITIZE_BYTES 属异常形态（通常是上游把
-			// 整个请求回显了）。只上报已读到的前缀，且明确标注未脱敏，
-			// 因为这条路径本身就是放弃脱敏的直通。
-			g.recordUpstreamStatus(resp, body, st, span, false)
+			// 整个请求回显了）。只上报已读到的前缀。
+			g.recordUpstreamStatus(resp, body, st, span)
 		}
 		return resp.StatusCode
 	}
@@ -178,10 +177,14 @@ func (g *Gateway) pipeBuffered(
 	obs.Add(ctx, st.mx.BytesOut, int64(n), a)
 	obs.Add(ctx, st.mx.Rewrites, st.rewrites, a)
 	if resp.StatusCode >= 400 {
-		// 上报脱敏后的 out 而非原始 body：错误正文里同样可能出现上游真实
-		// 模型名（"model xxx not found" 是最常见的一类错误），上报原文
-		// 等于绕过脱敏把上游形态泄漏进看板。
-		g.recordUpstreamStatus(resp, out, st, span, needSanitize)
+		// 上报**原始** body 而非脱敏后的 out：客户端拿到的仍是 out（脱敏过，
+		// 上面已写出），看板要的是上游到底说了什么。脱敏会把上游真实模型名
+		// 换掉，而"model xxx not found""quota exceeded for xxx"这类错误里，
+		// 那个模型名正是排查的全部信息量 —— 上报脱敏版等于把线索擦掉。
+		//
+		// 这是一个有意的权衡：上游形态只泄漏到自己的可观测性后端，不流向
+		// 客户端。若看板属于第三方，这条需要改回 out。
+		g.recordUpstreamStatus(resp, body, st, span)
 	}
 	return resp.StatusCode
 }
@@ -193,15 +196,12 @@ func (g *Gateway) pipeBuffered(
 //
 // 额外单独提取 request_id 与 retry-after：前者是找上游对账的唯一凭据，
 // 后者决定客户端该等多久，两者都值得成为可直接筛选的属性。
-// sanitized 为 false 表示正文未过脱敏（超限直通路径），此时正文可能含上游
-// 真实模型名 —— 看板上必须能把这类记录筛出来，否则会误以为所有上报正文
-// 都已脱敏。
-func (g *Gateway) recordUpstreamStatus(resp *http.Response, body []byte, st *state, span trace.Span, sanitized bool) {
+//
+// body 一律传上游原文（未脱敏）。因此不再有 body_sanitized 标记 —— 恒为
+// false 的属性没有信息量，只会让人以为存在"有时脱敏"的另一种情况。
+func (g *Gateway) recordUpstreamStatus(resp *http.Response, body []byte, st *state, span trace.Span) {
 	if id := upstreamRequestID(resp.Header); id != "" {
 		span.SetAttributes(attribute.String("gateway.upstream.request_id", id))
-	}
-	if !sanitized {
-		span.SetAttributes(attribute.Bool("gateway.error.body_sanitized", false))
 	}
 	if ra := resp.Header.Get("Retry-After"); ra != "" {
 		span.SetAttributes(attribute.String("http.response.retry_after", ra))

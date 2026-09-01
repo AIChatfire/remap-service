@@ -251,9 +251,11 @@ func hasAttr(s sdktrace.ReadOnlySpan, key string) bool {
 	return false
 }
 
-// 错误正文超过 MAX_SANITIZE_BYTES 时走放弃脱敏的直通路径，上报的正文
-// 可能含上游真实模型名。看板必须能筛出这类记录，否则会误以为所有上报
-// 正文都已脱敏。
+// 超过 MAX_SANITIZE_BYTES 的大正文同样按原文上报。
+//
+// 原先这里断言 body_sanitized=false（区分「脱敏过」与「超限直通」）。现在
+// 上报给看板的正文恒为上游原文，该标记恒 false、已随之移除 —— 恒定值不构成
+// 筛选维度。保留本用例是为了守住「大正文不会被截断成另一种形态」。
 func TestUnsanitizedErrorBodyIsFlagged(t *testing.T) {
 	// 正文里带上游真实模型名，正是脱敏本该抹掉、这条路径抹不掉的东西。
 	upstreamBody := `{"error":{"message":"model deepseek-v3-0324 not found","padding":"` +
@@ -275,34 +277,51 @@ func TestUnsanitizedErrorBodyIsFlagged(t *testing.T) {
 		t.Fatalf("状态码应透传，实际 %d", resp.StatusCode)
 	}
 
-	span := findSpanWithAttr(t, sr, "gateway.error.body_sanitized")
-	if attrBool(span, "gateway.error.body_sanitized") {
-		t.Error("超限直通未经脱敏，body_sanitized 应为 false")
-	}
-
-	// 顺带确认：这条路径上报的正文确实是未脱敏的原文，即标记没有虚报。
+	span := findSpanWithAttr(t, sr, "gateway.error.body")
 	if got := attrString(span, "gateway.error.body"); !strings.Contains(got, "deepseek-v3-0324") {
 		t.Errorf("超限直通应上报原文，实际 %q", got)
 	}
+	// 标记已移除：正文恒为原文后它恒 false，留着会让人误以为存在两种形态。
+	if attrString(span, "gateway.error.body_sanitized") != "" {
+		t.Error("body_sanitized 应已移除")
+	}
 }
 
-// 反向守卫：正常脱敏路径不该带 body_sanitized 标记，否则标记失去筛选意义。
+// 核心分工守卫：客户端收到的是脱敏版，看板收到的是上游原文。
+//
+// 两者必须同时断言。只查上报侧，「脱敏彻底失效、两边都是原文」也能通过；
+// 只查客户端侧，「上报侧也被脱敏、看板查不到真实上游模型」同样能通过。
 func TestSanitizedErrorBodyHasNoFlag(t *testing.T) {
-	const upstreamBody = `{"error":{"message":"rate limited","type":"rate_limit"}}`
+	// 正文带上游真实模型名 primary-up：脱敏会把它换成对外名 pub，
+	// 于是这一个字符串就能区分两侧拿到的是哪个版本。
+	const upstreamBody = `{"error":{"message":"rate limited on primary-up","type":"rate_limit"}}`
 
 	sr := tracetest.NewSpanRecorder()
 	gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(upstreamBody))
-	}, nil)
+	}, func(c *config.Config) {
+		c.Mapping.Models = map[string][]string{"pub": {"primary-up"}}
+	})
 
-	resp := post(t, gs, "/v1/chat/completions", chatBody, nil)
+	resp := post(t, gs, "/v1/chat/completions", `{"model":"pub"}`, nil)
 	defer resp.Body.Close()
 
+	clientBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取客户端正文失败: %v", err)
+	}
+	if strings.Contains(string(clientBody), "primary-up") {
+		t.Errorf("客户端正文泄漏上游模型名，脱敏失效: %q", clientBody)
+	}
+
 	span := findSpanWithAttr(t, sr, "gateway.error.body")
+	if got := attrString(span, "gateway.error.body"); !strings.Contains(got, "primary-up") {
+		t.Errorf("看板正文应为上游原文（含 primary-up），实际 %q", got)
+	}
 	if hasAttr(span, "gateway.error.body_sanitized") {
-		t.Error("正常脱敏路径不应带 body_sanitized 标记")
+		t.Error("body_sanitized 标记已移除，不应再出现")
 	}
 }
 

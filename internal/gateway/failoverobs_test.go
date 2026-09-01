@@ -98,14 +98,17 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 	if msg == "" {
 		t.Fatal("请求 span 缺少 logfire.msg，Logfire 列表行仍只显示最终 200")
 	}
-	if !strings.Contains(msg, "429") {
-		t.Errorf("logfire.msg 必须带上游真实状态码 429，实际 %q", msg)
-	}
-	// 不得把上游路径塞进文案：上游路径与入站路径几乎永远不同，按路径差异
-	// 触发会让**每一行**都挂括号，真正 429 的那几行反被淹没。路径靠
-	// gateway.upstream.path 属性筛，不进文案。
-	if strings.Contains(msg, "/api/") {
-		t.Errorf("logfire.msg 不应含上游路径（会让每行都挂括号），实际 %q", msg)
+	// 逐字锁定文案契约。上游路径**必须**在文案里：同一入站路径会按模型映射
+	// 打到不同上游端点（/api/v3/... 与 /compatible-mode/v1/...），只进 span
+	// 属性只能筛不能扫，列表上逐行可见才能看出流量实际去向。
+	// 末尾的 "→ 200" 由 Logfire 自动追加 http.response.status_code，不由
+	// 本函数写出，所以这里的期望串不含它。
+	// 上游路径取自 span 属性而非写死 /api/v3/...：fixture 的上游是本地
+	// httptest，路径与入站同名。写死真实上游路径会把测试绑到线上配置上。
+	upPath := attrString(sp, "gateway.upstream.path")
+	wantMsg := "gateway /v1/chat/completions → 200 (upstream " + upPath + " → 429)"
+	if msg != wantMsg {
+		t.Errorf("logfire.msg 文案不符\n got: %q\nwant: %q", msg, wantMsg)
 	}
 
 	// 等级抬到 warn(13) —— 这才是「看板上找不到 429」的真正成因。
@@ -268,4 +271,54 @@ func eventInt(e sdktrace.Event, key string) int {
 		}
 	}
 	return 0
+}
+
+// 上游 4xx 直通（401/403/429 未配 failover）时的列表文案与正文上报。
+//
+// 这类请求不发生切换，客户端最终状态码就等于上游状态码。它是看板上最高频的
+// 一类失败，必须满足两点：
+//   - 文案里要同时有上游端点与上游状态码（用户明确要求的形态）
+//   - 上报的错误正文是**上游原文**，不是发给客户端的脱敏版
+func TestUpstreamErrorPassthroughMsgAndRawBody(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		// 正文里带上游真实模型名：脱敏会把它换成对外名，据此即可判定
+		// 上报的是原文还是脱敏版。
+		_, _ = w.Write([]byte(`{"error":{"message":"no access to primary-up","type":"invalid_api_key"}}`))
+	}, func(c *config.Config) {
+		c.Mapping.Models = map[string][]string{"pub": {"primary-up"}}
+	})
+
+	resp := post(t, gs, "/v1/chat/completions", `{"model":"pub"}`, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("上游 401 应原样透传，实际 %d", resp.StatusCode)
+	}
+
+	sp := findSpanWithAttr(t, sr, "logfire.msg")
+	msg := attrString(sp, "logfire.msg")
+	if !strings.Contains(msg, "(upstream /") {
+		t.Errorf("文案必须含上游端点，实际 %q", msg)
+	}
+	if !strings.Contains(msg, "→ 401)") {
+		t.Errorf("上游失败时括号内必须带上游状态码 401，实际 %q", msg)
+	}
+	// 客户端自己就是 401，span 已 SetStatus(Error) → Logfire 渲染为 error 级。
+	// 此时再写 warn(13) 是把 error 降级，比不写更糟。
+	if got := attrInt(sp, "logfire.level_num"); got != 0 {
+		t.Errorf("客户端已是 4xx 时不应写 warn 等级（会降级 error），实际 %d", got)
+	}
+
+	// 正文必须是上游原文：脱敏版里 primary-up 已被替换成 pub，
+	// 这条断言同时锁住「客户端拿脱敏版、看板拿原文」的分工。
+	body := attrString(findSpanWithAttr(t, sr, "gateway.error.body"), "gateway.error.body")
+	if !strings.Contains(body, "primary-up") {
+		t.Errorf("上报给看板的正文应为上游原文（含真实模型名），实际 %q", body)
+	}
+	// body_sanitized 标记已随「恒传原文」移除：恒 false 的属性没有信息量。
+	if attrString(sp, "gateway.error.body_sanitized") != "" {
+		t.Error("body_sanitized 应已移除")
+	}
 }

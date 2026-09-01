@@ -191,43 +191,58 @@ func recordFailover(span trace.Span, stage, fromModel, toModel string, status in
 
 // SetRequestMsg 改写请求 span 在 Logfire 列表里显示的那一行文案。
 //
-// 只在**上游状态码与客户端最终状态码不一致**时写，也就是只有 failover 把
-// 上游的 429/503 救成 200 这一种情形：
+// 目标形态（末尾的 "→ 200" 由 Logfire 自动追加 http.response.status_code，
+// 不由本函数写出）：
 //
-//	gateway /v1/chat/completions 429→200
+//	gateway /v1/chat/completions → 200 (upstream /api/v3/chat/completions) → 200
+//	gateway /v1/chat/completions → 429 (upstream /api/v3/chat/completions → 429) → 429
 //
-// 刻意不因「路径不同」而写。上游路径与入站路径几乎永远不同
-// （/v1/... vs /api/v3/...），按路径差异触发会让**每一行**都挂上
-// "(upstream /api/v3/chat/completions)" 的括号，真正发生过 429 的那几行
-// 反而被淹没 —— 噪音掩盖信号，比不写更糟。上游路径已在 AttrUpstreamPath
-// span 属性里可筛，不需要挤进列表文案。
+// 两条规则：
+//   - **上游路径恒进文案**。它是"这次请求实际打到哪个上游端点"的唯一现场，
+//     而同一个入站路径会按模型映射打到不同上游（/api/v3/... 与
+//     /compatible-mode/v1/...）。放在 span 属性里只能筛不能扫，列表上逐行
+//     可见才能一眼看出流量的实际去向。
+//   - **上游状态码只在上游失败（>= 400）时才进括号**。判据是"上游是否失败"，
+//     不是"上游与客户端是否不同"：401/403 直通时两者相同，但那个状态码正是
+//     上游给的、必须显示；而上游 200 时写它纯属重复。
 //
-// 文案里不重复写最终状态码：Logfire 会自动在末尾追加
-// http.response.status_code，自己再写一遍会得到 "→200 ... → 200"。
-// 这里用紧凑的 "429→200" 表达「上游 429、客户端 200」，与自动追加的尾巴
-// 连起来读也不冲突。
+// upstreamPath 为空且上游未失败时不写属性 —— 默认渲染已足够。
 func SetRequestMsg(span trace.Span, route, upstreamPath string, clientStatus, upstreamStatus int) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	if upstreamStatus <= 0 || upstreamStatus == clientStatus {
+	upFailed := upstreamStatus >= 400
+	if upstreamPath == "" && !upFailed {
 		return
 	}
 
 	var b strings.Builder
-	b.Grow(len(route) + 24)
+	b.Grow(len(route) + len(upstreamPath) + 40)
 	b.WriteString("gateway ")
 	b.WriteString(route)
-	b.WriteByte(' ')
-	b.WriteString(strconv.Itoa(upstreamStatus))
-	b.WriteString("→")
+	b.WriteString(" → ")
 	b.WriteString(strconv.Itoa(clientStatus))
-	span.SetAttributes(
-		attribute.String(AttrLogfireMsg, b.String()),
-		// 请求本身成功了，不能标红；但「被 429 顶掉后靠切换救回」必须能
-		// 从成功流量里筛出来，否则主模型持续降级完全不可见。
-		attribute.Int(AttrLogfireLevel, LevelWarn),
-	)
+	b.WriteString(" (upstream")
+	if upstreamPath != "" {
+		b.WriteByte(' ')
+		b.WriteString(upstreamPath)
+	}
+	if upFailed {
+		b.WriteString(" → ")
+		b.WriteString(strconv.Itoa(upstreamStatus))
+	}
+	b.WriteByte(')')
+
+	attrs := make([]attribute.KeyValue, 0, 2)
+	attrs = append(attrs, attribute.String(AttrLogfireMsg, b.String()))
+	// 只有「上游失败过、但客户端最终成功」才抬等级：那是 failover 救回来的
+	// 请求，span 状态是 OK（标红等于伪造故障），不抬等级就永远埋在成功流量里。
+	// 客户端自己也是 4xx/5xx 时无需抬 —— RecordUpstreamError 已 SetStatus
+	// 为 Error，Logfire 渲染成 error 级，再写 warn 反而是降级。
+	if upFailed && clientStatus < 400 {
+		attrs = append(attrs, attribute.Int(AttrLogfireLevel, LevelWarn))
+	}
+	span.SetAttributes(attrs...)
 }
 
 // ErrorBodyLimit 报告允许上报的错误正文字节上限。
