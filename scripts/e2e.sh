@@ -71,14 +71,32 @@ EOF
 ./bin/gateway -env "$ENVFILE" >/tmp/e2e_gw.log 2>&1 &
 GW_PID=$!
 
-for _ in $(seq 1 60); do
-  if "${CURL[@]}" -f "http://127.0.0.1:${GW_PORT}/healthz" >/dev/null 2>&1 &&
-     grep -q listening /tmp/e2e_up.log; then
+# 就绪判断必须是「真的能建连」，不能只 grep 日志行。
+#
+# 日志行只证明进程跑到了那句 print，不证明 socket 已 accept。之前正是这样
+# 提前放行，CI 上最先几个断言打在未监听的端口上，报成 upstream connection
+# failed —— 看着像脱敏失效，实际是启动竞态。这里改为直连上游端口探活。
+UP_READY=0
+for _ in $(seq 1 100); do
+  if "${CURL[@]}" -o /dev/null --max-time 1 \
+       -X POST "http://127.0.0.1:${UP_PORT}/v1/chat/completions" \
+       -d '{"model":"probe"}' 2>/dev/null &&
+     "${CURL[@]}" -f --max-time 1 "http://127.0.0.1:${GW_PORT}/healthz" >/dev/null 2>&1; then
+    UP_READY=1
     break
   fi
   sleep 0.1
 done
-grep -q listening /tmp/e2e_up.log || { echo "mock 上游未能启动:"; cat /tmp/e2e_up.log; exit 1; }
+if [[ $UP_READY -eq 0 ]]; then
+  echo "mock 上游或网关未能在 10s 内就绪"
+  echo "--- 上游日志 ---"; cat /tmp/e2e_up.log
+  echo "--- 网关日志 ---"; cat /tmp/e2e_gw.log
+  exit 1
+fi
+# 探活会往日志写一行 model=probe。不要在这里截断日志：mock 进程的文件偏移
+# 不会跟着回零，后续写入将在文件头部留下一段 NUL 空洞，grep 直接判定
+# 「Binary file matches」而不输出内容 —— 后面所有靠 grep 取日志的断言会集体
+# 假失败。各断言取的都是自己那次请求之后的 tail -1，探活那行不干扰。
 
 GW="http://127.0.0.1:${GW_PORT}"
 AUTH=(-H "Authorization: Bearer sk-client-key")

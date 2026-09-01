@@ -111,5 +111,12 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9911
+    # 必须先构造（构造即 bind+listen）再打印。
+    #
+    # 反过来写会让 e2e 的就绪检查提前放行：那边靠 grep 这行日志判断上游可用，
+    # 而此时 socket 还没绑定。本机 Python 启动快、间隙可忽略，CI 上冷启动慢，
+    # 最先几个断言就会打在未监听的端口上，报成 upstream connection failed ——
+    # 看着像脱敏失效，实际是启动竞态。
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"mock upstream listening on :{port}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    srv.serve_forever()
