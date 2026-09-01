@@ -232,16 +232,11 @@ func attrString(s sdktrace.ReadOnlySpan, key string) string {
 	return ""
 }
 
-func attrBool(s sdktrace.ReadOnlySpan, key string) bool {
-	for _, kv := range s.Attributes() {
-		if string(kv.Key) == key {
-			return kv.Value.AsBool()
-		}
-	}
-	return false
-}
-
 // hasAttr 报告 span 上是否存在该属性，用于断言「不该出现的属性确实没出现」。
+//
+// 布尔属性一律用本函数断言，不要重新引入 attrBool：读值版对「属性不存在」
+// 与「属性为 false」返回同一个 false，两种形态分不开 —— body_sanitized
+// 移除后正是靠 hasAttr 才锁住「键彻底消失」而非「恒为 false」。
 func hasAttr(s sdktrace.ReadOnlySpan, key string) bool {
 	for _, kv := range s.Attributes() {
 		if string(kv.Key) == key {
