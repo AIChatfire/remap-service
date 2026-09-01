@@ -98,19 +98,35 @@ const (
 	// 本键在所有上游响应（成功或失败）后都写入，是更通用的诊断维度。
 	AttrUpstreamStatus = "gateway.upstream.status_code"
 
-	// AttrLogfireMsg 覆盖 Logfire 列表里那一行渲染出来的文案。
+	// AttrLogfireMsg 覆盖 Logfire 记录在列表里渲染出来的文案。
 	//
-	// 这是「429 在看板上查不到」的真正成因：Logfire 的 Message 列不读
-	// 自定义属性，只渲染本键，缺失时才回落 span name 并自动追加
-	// http.response.status_code —— 于是 failover 成功的请求恒显示
-	// "gateway /v1/chat/completions → 200"，而事件行只有静态事件名
-	// "gateway.attempt_failed"，上游路径与真实状态码全都不出现在列表上。
-	// 加 span 属性解决的是「能不能筛」，本键解决的是「扫一眼能不能看见」，
-	// 两者互不替代。
+	// 只对 span 本身有效，**对 span event 无效**：事件行恒显示静态事件名，
+	// 写了也不渲染，且 logfire.* 属性会被 Logfire 消费、不出现在 Attributes
+	// 面板里 —— 于是「写了没生效」和「没写」在 UI 上完全同形，白耗一个属性。
+	// 事件要在列表上可辨识，靠的是 AttrLogfireLevel 抬等级，不是本键。
 	//
-	// 只在信息确实与 span name 不同时才写（failover、上游失败），
-	// 正常请求不写 —— 与默认渲染一致的字符串是纯浪费。
+	// 只在信息确实与默认渲染不同时才写，且注意 Logfire 会在文案末尾自动
+	// 追加 http.response.status_code —— 自己再写一遍最终状态码会出现
+	// "→ 200 ... → 200" 的重复尾巴。
 	AttrLogfireMsg = "logfire.msg"
+
+	// AttrLogfireLevel 是 Logfire 的记录等级（OTel SeverityNumber）。
+	//
+	// span 没有原生 severity：Logfire 只认「span 状态为 ERROR → error，
+	// 否则一律 info」。而 failover 成功的请求状态就是 OK（对客户端确实没
+	// 故障，不能标红），于是被 429 顶掉这件事在等级上与一次普通成功毫无
+	// 区别 —— 这才是「看板上找不到 429」的真正成因：不是没上报，是没有
+	// 任何维度能把它从成功流量里筛出来。
+	//
+	// 写 13（warn）让它落在 level >= 'warn' 的筛选里：既不像 error 那样
+	// 制造假故障（请求最终成功了），又不至于淹没在 info 里。
+	AttrLogfireLevel = "logfire.level_num"
+
+	// LevelWarn 是 OTel SeverityNumber 里的 WARN。
+	//
+	// 取值遵循 OTel 规范（trace=1 debug=5 info=9 notice=10 warn=13
+	// error=17 fatal=21），不可自定义 —— Logfire 按这套数值映射等级名。
+	LevelWarn = 13
 )
 
 // RecordFailover 把「发生过故障切换」这件事落到请求 span 的属性上。
@@ -175,41 +191,43 @@ func recordFailover(span trace.Span, stage, fromModel, toModel string, status in
 
 // SetRequestMsg 改写请求 span 在 Logfire 列表里显示的那一行文案。
 //
-// 默认渲染只有 span name + 客户端最终状态码，于是「上游 429 被切换后返回
-// 200」在列表上与一次普通成功完全同形，必须点开事件才知道发生过什么。
-// 这里把上游真实路径与真实状态码补进那一行：
+// 只在**上游状态码与客户端最终状态码不一致**时写，也就是只有 failover 把
+// 上游的 429/503 救成 200 这一种情形：
 //
-//	gateway /v1/chat/completions → 200 (upstream /api/v3/chat/completions → 429)
+//	gateway /v1/chat/completions 429→200
 //
-// upstreamStatus <= 0 或与 clientStatus 相同且路径也无差异时不写 —— 那种
-// 情况默认渲染已经足够，多写一个属性只是浪费带宽。
+// 刻意不因「路径不同」而写。上游路径与入站路径几乎永远不同
+// （/v1/... vs /api/v3/...），按路径差异触发会让**每一行**都挂上
+// "(upstream /api/v3/chat/completions)" 的括号，真正发生过 429 的那几行
+// 反而被淹没 —— 噪音掩盖信号，比不写更糟。上游路径已在 AttrUpstreamPath
+// span 属性里可筛，不需要挤进列表文案。
+//
+// 文案里不重复写最终状态码：Logfire 会自动在末尾追加
+// http.response.status_code，自己再写一遍会得到 "→200 ... → 200"。
+// 这里用紧凑的 "429→200" 表达「上游 429、客户端 200」，与自动追加的尾巴
+// 连起来读也不冲突。
 func SetRequestMsg(span trace.Span, route, upstreamPath string, clientStatus, upstreamStatus int) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	sameStatus := upstreamStatus <= 0 || upstreamStatus == clientStatus
-	samePath := upstreamPath == "" || upstreamPath == route
-	if sameStatus && samePath {
+	if upstreamStatus <= 0 || upstreamStatus == clientStatus {
 		return
 	}
 
 	var b strings.Builder
-	b.Grow(len(route) + len(upstreamPath) + 48)
+	b.Grow(len(route) + 24)
 	b.WriteString("gateway ")
 	b.WriteString(route)
-	b.WriteString(" → ")
+	b.WriteByte(' ')
+	b.WriteString(strconv.Itoa(upstreamStatus))
+	b.WriteString("→")
 	b.WriteString(strconv.Itoa(clientStatus))
-	b.WriteString(" (upstream")
-	if !samePath {
-		b.WriteByte(' ')
-		b.WriteString(upstreamPath)
-	}
-	if !sameStatus {
-		b.WriteString(" → ")
-		b.WriteString(strconv.Itoa(upstreamStatus))
-	}
-	b.WriteByte(')')
-	span.SetAttributes(attribute.String(AttrLogfireMsg, b.String()))
+	span.SetAttributes(
+		attribute.String(AttrLogfireMsg, b.String()),
+		// 请求本身成功了，不能标红；但「被 429 顶掉后靠切换救回」必须能
+		// 从成功流量里筛出来，否则主模型持续降级完全不可见。
+		attribute.Int(AttrLogfireLevel, LevelWarn),
+	)
 }
 
 // ErrorBodyLimit 报告允许上报的错误正文字节上限。
@@ -361,38 +379,15 @@ func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status 
 		}
 	}
 
-	// 事件名是静态的，Logfire 列表里那一行只会显示 "gateway.attempt_failed"，
-	// 路径与状态码都得展开属性才看得到。写 logfire.msg 让这一行自解释：
-	//   gateway.attempt_failed status /api/v3/chat/completions → 429 (deepseek-v4)
-	attrs = append(attrs, attribute.String(AttrLogfireMsg,
-		attemptMsg(stage, model, urlPath, status)))
+	// 抬等级到 warn，这是让失败尝试在看板上可筛的唯一手段。
+	//
+	// 不能靠 logfire.msg：那个键对 span event 不渲染（见其注释）。也不能靠
+	// 标红 span：failover 成功时请求对客户端没故障，标红会制造假故障。
+	// 于是默认下这条 429 事件等级是 info，与成功流量完全同级、无从筛出 ——
+	// 「看板上找不到 429」正是这么来的。
+	attrs = append(attrs, attribute.Int(AttrLogfireLevel, LevelWarn))
 
 	span.AddEvent("gateway.attempt_failed", trace.WithAttributes(attrs...))
-}
-
-// attemptMsg 拼出失败尝试在列表里显示的一行文案。
-//
-// 手工拼接而不用 fmt.Sprintf：这是每次上游失败都会走的路径，
-// strconv + 预分配 Builder 无反射开销，且失败分支本就不该再加成本。
-func attemptMsg(stage, model, urlPath string, status int) string {
-	var b strings.Builder
-	b.Grow(len(stage) + len(urlPath) + len(model) + 40)
-	b.WriteString("gateway.attempt_failed ")
-	b.WriteString(stage)
-	if urlPath != "" {
-		b.WriteByte(' ')
-		b.WriteString(urlPath)
-	}
-	if status > 0 {
-		b.WriteString(" → ")
-		b.WriteString(strconv.Itoa(status))
-	}
-	if model != "" {
-		b.WriteString(" (")
-		b.WriteString(model)
-		b.WriteByte(')')
-	}
-	return b.String()
 }
 
 // AttrProvider 由「自身携带结构化诊断字段」的错误类型实现。
