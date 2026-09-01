@@ -345,7 +345,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	st.ttfb = time.Since(sendAt)
 	obs.Record(ctx, st.mx.TTFB, float64(st.ttfb.Microseconds())/1000.0,
 		st.metricAttrs("ok", resp.StatusCode))
-	
+
 	// 只在非 failover 场景才写入最终状态码 —— failover 场景已在上面写过首次失败状态码。
 	// 避免用切换后的 200 覆盖掉诊断价值更高的首次失败 429。
 	if !st.failedOver {
