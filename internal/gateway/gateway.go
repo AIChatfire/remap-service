@@ -286,6 +286,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			// 的实际状态码判定 —— 连上了但备用返回 503 也是 exhausted。
 			obs.RecordFailover(span, "transport", failedModel, st.upstreamModel,
 				0, resp.StatusCode)
+			// transport 层 failover 无首次状态码（连接失败没有响应），不写 upstream.status_code
 		} else {
 			// 主备都连不上，重试请求没能发出。
 			obs.RecordFailoverAborted(span, "transport", failedModel, 0)
@@ -326,10 +327,16 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			// 在此处判断，判据集中在 obs 侧，避免两个调用点各写一套。
 			obs.RecordFailover(span, "status", failedModel, st.upstreamModel,
 				firstStatus, resp.StatusCode)
+			// 立即写入首次失败状态码到 gateway.upstream.status_code，
+			// 确保即使切换成功（最终 200），看板仍能直接看到首次的 429。
+			// 这与后续 340 行写入切换后状态码不冲突 —— 后者会被这里覆盖。
+			span.SetAttributes(attribute.Int(obs.AttrUpstreamStatus, firstStatus))
 		} else {
 			// 重试请求没发出去（改写/构造/连接失败），是网关侧问题，
 			// 排查方向与「备用模型也挂」完全不同，需单独一种 outcome。
 			obs.RecordFailoverAborted(span, "status", failedModel, firstStatus)
+			// 同样写入首次失败状态码
+			span.SetAttributes(attribute.Int(obs.AttrUpstreamStatus, firstStatus))
 		}
 	}
 	defer cancel()
@@ -338,11 +345,22 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	st.ttfb = time.Since(sendAt)
 	obs.Record(ctx, st.mx.TTFB, float64(st.ttfb.Microseconds())/1000.0,
 		st.metricAttrs("ok", resp.StatusCode))
-	span.SetAttributes(
-		attribute.Int("http.response.status_code", resp.StatusCode),
-		attribute.Int(obs.AttrUpstreamStatus, resp.StatusCode),
-		attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
-	)
+	
+	// 只在非 failover 场景才写入最终状态码 —— failover 场景已在上面写过首次失败状态码。
+	// 避免用切换后的 200 覆盖掉诊断价值更高的首次失败 429。
+	if !st.failedOver {
+		span.SetAttributes(
+			attribute.Int("http.response.status_code", resp.StatusCode),
+			attribute.Int(obs.AttrUpstreamStatus, resp.StatusCode),
+			attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
+		)
+	} else {
+		// failover 场景只写客户端收到的最终状态码与 ttfb，upstream.status_code 已写过
+		span.SetAttributes(
+			attribute.Int("http.response.status_code", resp.StatusCode),
+			attribute.Int64("gateway.ttfb_ms", st.ttfb.Milliseconds()),
+		)
+	}
 
 	// ---------- 4. 响应脱敏并回写 ----------
 	rep := g.replacerFor(st)

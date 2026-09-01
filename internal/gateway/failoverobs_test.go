@@ -80,9 +80,10 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 		t.Errorf("最终状态码应保持 200，实际 %d", got)
 	}
 
-	// 新增校验：gateway.upstream.status_code 应与最终状态码一致（切换成功后为 200）
-	if got := attrInt(sp, "gateway.upstream.status_code"); got != http.StatusOK {
-		t.Errorf("gateway.upstream.status_code 应为最终的 200，实际 %d", got)
+	// 关键修复：gateway.upstream.status_code 应记录首次失败的 429，而非切换后的 200。
+	// 这样即使 failover 成功，看板仍能直接筛选出所有被 429 顶掉的请求。
+	if got := attrInt(sp, "gateway.upstream.status_code"); got != http.StatusTooManyRequests {
+		t.Errorf("gateway.upstream.status_code 应为首次失败的 429，实际 %d", got)
 	}
 
 	// 新增校验：gateway.upstream.path 应在 span 属性中可见
