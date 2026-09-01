@@ -337,27 +337,29 @@ func TestStructuredAttrsThroughWrap(t *testing.T) {
 	}
 }
 
-// failover 的中间失败事件也要带结构化字段，否则「为什么老在切换」
+// failover 的中间失败也要带结构化字段，否则「为什么老在切换」
 // 只能看到一句无信息的超时。
 func TestAttemptFailureCarriesStructuredAttrs(t *testing.T) {
 	span, done := newRecordedSpan(t)
-	RecordAttemptFailure(span, "transport", "m-up", "/v1/chat/completions", 0, &attrErr{
+	RecordAttemptFailure(span, "transport", "m-up", "/v1/chat/completions", 0, 1, &attrErr{
 		msg:   "timeout",
 		attrs: map[string]string{"gateway.timeout.kind": "first_byte"},
 	})
 	s := done()
 
-	if len(s.Events()) != 1 {
-		t.Fatalf("期望 1 个事件，实际 %d", len(s.Events()))
+	// 现场落在 span 属性上，不再发 event —— event 在 Logfire 的 trace 列表里
+	// 占一整行却改不掉文案，父 span 已写明上游状态码时那行是纯噪音。
+	if len(s.Events()) != 0 {
+		t.Errorf("不应再发 span event，实际 %d 个", len(s.Events()))
 	}
 	var found bool
-	for _, kv := range s.Events()[0].Attributes {
+	for _, kv := range s.Attributes() {
 		if string(kv.Key) == "gateway.timeout.kind" && kv.Value.AsString() == "first_byte" {
 			found = true
 		}
 	}
 	if !found {
-		t.Error("attempt_failed 事件缺少结构化字段")
+		t.Error("失败尝试缺少结构化字段")
 	}
 	// 中间失败不改 span 状态，这条约束不能被本次改动破坏。
 	if s.Status().Code == codes.Error {
@@ -382,20 +384,16 @@ func TestPlainErrorNoExtraAttrs(t *testing.T) {
 func TestAttemptFailureCarriesUpstreamErrorBody(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	body := []byte(`{"error":{"message":"Rate limit exceeded for model deepseek-v3","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
-	RecordAttemptFailure(span, "status", "deepseek-v3-flash-ga-260731", "/v1/chat/completions", 429, body)
+	RecordAttemptFailure(span, "status", "deepseek-v3-flash-ga-260731", "/v1/chat/completions", 429, 1, body)
 	s := done()
 
-	if len(s.Events()) != 1 {
-		t.Fatalf("期望 1 个事件，实际 %d", len(s.Events()))
-	}
-	evt := s.Events()[0]
-	if evt.Name != "gateway.attempt_failed" {
-		t.Errorf("事件名应为 gateway.attempt_failed，实际 %q", evt.Name)
+	if len(s.Events()) != 0 {
+		t.Errorf("不应再发 span event，实际 %d 个", len(s.Events()))
 	}
 
 	var foundBody, foundSize, foundStatus bool
 	var bodyVal, sizeVal, statusVal string
-	for _, kv := range evt.Attributes {
+	for _, kv := range s.Attributes() {
 		k := string(kv.Key)
 		switch k {
 		case "gateway.attempt.error_body":
@@ -434,13 +432,12 @@ func TestAttemptFailureBodyTruncatesOnRuneBoundary(t *testing.T) {
 	span, done := newRecordedSpan(t)
 	// 构造一个 3KB 的中文错误正文，超过 2KB 截断阈值
 	body := []byte(strings.Repeat("错误详情：配额已用尽。", 100))
-	RecordAttemptFailure(span, "status", "m", "/v1/chat/completions", 429, body)
+	RecordAttemptFailure(span, "status", "m", "/v1/chat/completions", 429, 1, body)
 	s := done()
 
-	evt := s.Events()[0]
 	var bodyVal string
 	var truncated bool
-	for _, kv := range evt.Attributes {
+	for _, kv := range s.Attributes() {
 		switch string(kv.Key) {
 		case "gateway.attempt.error_body":
 			bodyVal = kv.Value.AsString()
@@ -463,15 +460,23 @@ func TestAttemptFailureBodyTruncatesOnRuneBoundary(t *testing.T) {
 // 空正文不应产生正文相关属性。
 func TestAttemptFailureEmptyBodyIsNoop(t *testing.T) {
 	span, done := newRecordedSpan(t)
-	RecordAttemptFailure(span, "status", "m", "/v1/chat/completions", 503, []byte{})
+	RecordAttemptFailure(span, "status", "m", "/v1/chat/completions", 503, 1, []byte{})
 	s := done()
 
-	evt := s.Events()[0]
-	for _, kv := range evt.Attributes {
+	// 先确认确实写了属性：改读 span 属性后，若函数一个属性都没写，
+	// 下面的遍历会在空集合上恒真 —— 测试静默退化成 noop。
+	var sawStage bool
+	for _, kv := range s.Attributes() {
 		k := string(kv.Key)
+		if k == AttrAttemptStage {
+			sawStage = true
+		}
 		if strings.Contains(k, "error_body") || strings.Contains(k, "error_truncated") {
 			t.Errorf("空正文不应产生正文相关属性: %s", k)
 		}
+	}
+	if !sawStage {
+		t.Fatalf("未写入 %s，断言退化为 noop", AttrAttemptStage)
 	}
 }
 

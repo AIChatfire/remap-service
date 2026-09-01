@@ -185,17 +185,17 @@ func (g *Gateway) retryWithFallback(
 			limit = firstResp.ContentLength
 		}
 		errBody, _ := io.ReadAll(io.LimitReader(firstResp.Body, limit))
-		obs.RecordAttemptFailure(span, "status", st.upstreamModel, urlPath, firstResp.StatusCode, errBody)
+		obs.RecordAttemptFailure(span, "status", st.upstreamModel, urlPath, firstResp.StatusCode, st.nextAttempt(), errBody)
 	}
 
 	nb, err := protocol.RewriteModel(body, plan.model)
 	if err != nil {
-		obs.RecordAttemptFailure(span, "rewrite", plan.model, "", 0, err)
+		obs.RecordAttemptFailure(span, "rewrite", plan.model, "", 0, st.nextAttempt(), err)
 		return nil, nil, false
 	}
 	ureq, err := g.buildRequest(ctx, r, spec, base, nb)
 	if err != nil {
-		obs.RecordAttemptFailure(span, "build", plan.model, "", 0, err)
+		obs.RecordAttemptFailure(span, "build", plan.model, "", 0, st.nextAttempt(), err)
 		return nil, nil, false
 	}
 	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
@@ -203,8 +203,17 @@ func (g *Gateway) retryWithFallback(
 		if cancel != nil {
 			cancel()
 		}
-		obs.RecordAttemptFailure(span, "transport", plan.model, ureq.URL.Path, 0, err)
+		obs.RecordAttemptFailure(span, "transport", plan.model, ureq.URL.Path, 0, st.nextAttempt(), err)
 		return nil, nil, false
+	}
+	// 重试**发出去了**不等于请求被救回：备用模型同样返回 503 时 err 为 nil，
+	// 这里若直接返回，那次上游失败就无人上报 —— 看板上只剩首次失败，
+	// 「主挂了、备也挂了」与「主挂了、备救回了」的失败次数完全同形。
+	//
+	// 不读正文：正文归下游（错误正文上报走 RecordGatewayError，成功则由
+	// pipeBuffered 直通），在这里 ReadAll 会把它从流里吃掉。
+	if resp.StatusCode >= 400 {
+		obs.RecordAttemptFailure(span, "status", plan.model, ureq.URL.Path, resp.StatusCode, st.nextAttempt(), nil)
 	}
 	return resp, cancel, true
 }

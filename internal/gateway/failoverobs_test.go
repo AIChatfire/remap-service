@@ -46,19 +46,30 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 		t.Fatalf("上游应被调用 2 次（首次 + 重试），实际 %d", got)
 	}
 
-	ev := findEvent(t, sr, "gateway.attempt_failed")
-	if got := eventInt(ev, "gateway.attempt.status_code"); got != http.StatusTooManyRequests {
-		t.Errorf("事件应记录被切掉的状态码 429，实际 %d", got)
+	// 失败现场落在 span 属性上，且不再发 span event —— event 在 Logfire 的
+	// trace 列表里占一整行，文案又恒为静态事件名改不掉（logfire.msg 对
+	// event 无效），父 span 已写明 "→ 200 (upstream ... → 429)" 时是纯噪音。
+	if ev, ok := findEventOK(sr, "gateway.attempt_failed"); ok {
+		t.Errorf("不应再发 gateway.attempt_failed 事件（属性: %v）", ev.Attributes)
 	}
-	if got := eventString(ev, "gateway.attempt.stage"); got != "status" {
+	attemptSpan := findSpanWithAttr(t, sr, "gateway.attempt.status_code")
+	if got := attrInt(attemptSpan, "gateway.attempt.status_code"); got != http.StatusTooManyRequests {
+		t.Errorf("应记录被切掉的状态码 429，实际 %d", got)
+	}
+	if got := attrString(attemptSpan, "gateway.attempt.stage"); got != "status" {
 		t.Errorf("stage 应为 status，实际 %q", got)
 	}
+	// 只失败过一次时 count 必须是 1：多次失败会互相覆盖属性，count 是
+	// 判断「属性描述的是不是全部」的唯一依据。
+	if got := attrInt(attemptSpan, "gateway.attempt.count"); got != 1 {
+		t.Errorf("本用例只失败一次，count 应为 1，实际 %d", got)
+	}
 
-	// 事件之外，429 还必须作为 span 属性存在。
+	// 429 还必须作为 failover 维度的 span 属性存在。
 	//
-	// 只进事件是不够的：Logfire 的 trace 列表、Full Trace 视图和属性筛选
-	// 都只读 span 属性，切换成功后 http.response.status_code 恒为 200，
-	// 于是「今天有多少请求被 429 顶掉」必须逐条展开事件才能回答。
+	// Logfire 的 trace 列表、Full Trace 视图和属性筛选都只读 span 属性，
+	// 切换成功后 http.response.status_code 恒为 200，
+	// 于是「今天有多少请求被 429 顶掉」必须靠这些属性才能回答。
 	sp := findSpanWithAttr(t, sr, "gateway.failover.first_status_code")
 	if got := attrInt(sp, "gateway.failover.first_status_code"); got != http.StatusTooManyRequests {
 		t.Errorf("span 属性应记录首次失败的 429，实际 %d", got)
@@ -120,14 +131,15 @@ func TestFailoverRecordsAttemptButKeepsSpanOK(t *testing.T) {
 		t.Errorf("请求 span 等级应为 warn(13)，实际 %d", got)
 	}
 
-	// 事件同理靠等级可筛。
-	if got := eventInt(ev, "logfire.level_num"); got != 13 {
-		t.Errorf("attempt 事件等级应为 warn(13)，实际 %d", got)
-	}
-	// 反向锁定：logfire.msg 对 span event 不渲染，写了是纯浪费且「写了没
-	// 生效」与「没写」在 UI 上同形，不许再加回来。
-	if got := eventString(ev, "logfire.msg"); got != "" {
-		t.Errorf("事件不应写 logfire.msg（Logfire 不渲染事件文案），实际 %q", got)
+	// 反向锁定：整条 trace 不得有任何 span event。
+	//
+	// event 的文案改不掉（logfire.msg 只对 span 生效），在列表里占一整行
+	// 却恒显示静态事件名，父 span 已写明上游状态码时纯属噪音。
+	// 这条断言防止后续「顺手加个事件记一下」把噪音带回来。
+	for _, s := range sr.Ended() {
+		if len(s.Events()) != 0 {
+			t.Errorf("span %s 不应带 event，实际 %d 个", s.Name(), len(s.Events()))
+		}
 	}
 
 	// 关键断言：整个 span 不得为 Error。
@@ -160,11 +172,26 @@ func TestFailoverAttemptFailureIsRecorded(t *testing.T) {
 		t.Fatalf("两次都失败应透传 503，实际 %d", resp.StatusCode)
 	}
 
-	// 首次 503 被切掉 → 留一条 attempt 事件；重试仍 503 → 走正常
-	// 上游错误上报，正文进 span。
-	ev := findEvent(t, sr, "gateway.attempt_failed")
-	if got := eventString(ev, "gateway.attempt.stage"); got != "status" {
+	// 首次 503 被切掉 → 记一次失败现场；重试仍 503 → 再记一次，
+	// 属性互相覆盖，留下的是**最后一次**。
+	attemptSpan := findSpanWithAttr(t, sr, "gateway.attempt.stage")
+	if got := attrString(attemptSpan, "gateway.attempt.stage"); got != "status" {
 		t.Errorf("stage 应为 status，实际 %q", got)
+	}
+
+	// 计数是覆盖语义的唯一补偿，必须如实递增。
+	//
+	// 失败现场从 event 改为 span 属性后，同一请求内的多次失败会互相覆盖，
+	// 面板上只剩最后一次。若计数恒为 1，「只失败过一次」与「失败三次只
+	// 留了最后一次」在看板上完全同形 —— 这一条是唯一能区分两者的信号。
+	// 这个场景主备都 503，status 阶段确实发生两次。
+	if got := attrInt(attemptSpan, "gateway.attempt.count"); got != 2 {
+		t.Errorf("主备双 503 应记两次失败尝试，实际 count=%d", got)
+	}
+	// 留痕的是最后一次（备用模型），不是首次 —— 覆盖方向也要锁定，
+	// 否则「写了第一次就不再更新」这种 bug 形态照样通过。
+	if got := attrString(attemptSpan, "gateway.attempt.model"); got != "backup-up" {
+		t.Errorf("覆盖后应留最后一次的 backup-up，实际 %q", got)
 	}
 	span := findSpanWithAttr(t, sr, "gateway.error.body")
 	if got := attrString(span, "gateway.error.body"); got == "" {
@@ -192,20 +219,14 @@ func TestFailoverAttemptFailureIsRecorded(t *testing.T) {
 		t.Errorf("to_model 应为 backup-up，实际 %q", got)
 	}
 
-	// span 上的 url.path 是入站路径，必须保持客户端实际打的那个。
+	// 上游路径只能落在独立键上。两条断言都必要：只断言新键存在时，
+	// 「两个键同时写」这种 bug 形态照样通过 —— 而那正是之前的形态
+	//（上游路径混进入站语义的 url.path，两种路径再也分不开）。
+	if got := attrString(sp, "gateway.upstream.path"); got == "" {
+		t.Error("缺少 gateway.upstream.path，无法定位上游端点")
+	}
 	if got := attrString(sp, "url.path"); got != "/v1/chat/completions" {
-		t.Errorf("span 的 url.path 应为入站路径，实际 %q", got)
-	}
-
-	// 上游路径只能落在独立键上。断言分两条且都必要：
-	// 只断言新键存在时，事件里同时写了 url.path 也能通过 —— 而那正是
-	// 之前的 bug 形态（上游路径混进入站语义的键，两种路径无法区分）。
-	ev2 := findEvent(t, sr, "gateway.attempt_failed")
-	if got := eventString(ev2, "gateway.upstream.path"); got == "" {
-		t.Error("事件缺少 gateway.upstream.path，无法定位上游端点")
-	}
-	if got := eventString(ev2, "url.path"); got != "" {
-		t.Errorf("事件不得写 url.path（那是入站语义），实际 %q", got)
+		t.Errorf("url.path 必须仍是客户端实际打的入站路径，实际 %q", got)
 	}
 }
 
@@ -236,41 +257,19 @@ func TestFailoverOutcomeSucceeded(t *testing.T) {
 	}
 }
 
-func findEvent(t *testing.T, sr *tracetest.SpanRecorder, name string) sdktrace.Event {
-	t.Helper()
+// findEventOK 用于断言某事件**不存在**，所以返回 bool 而非 t.Fatal。
+//
+// 失败现场已改为 span 属性，事件不该再出现；这个方向的断言必须能在
+// 「找不到」时正常返回，否则辅助函数自己就会把测试判失败。
+func findEventOK(sr *tracetest.SpanRecorder, name string) (sdktrace.Event, bool) {
 	for _, s := range sr.Ended() {
 		for _, e := range s.Events() {
 			if e.Name == name {
-				return e
+				return e, true
 			}
 		}
 	}
-	var seen []string
-	for _, s := range sr.Ended() {
-		for _, e := range s.Events() {
-			seen = append(seen, e.Name)
-		}
-	}
-	t.Fatalf("没有 span 带事件 %s（实际事件: %v）—— 记录函数可能未被调用", name, seen)
-	return sdktrace.Event{}
-}
-
-func eventString(e sdktrace.Event, key string) string {
-	for _, kv := range e.Attributes {
-		if string(kv.Key) == key {
-			return kv.Value.AsString()
-		}
-	}
-	return ""
-}
-
-func eventInt(e sdktrace.Event, key string) int {
-	for _, kv := range e.Attributes {
-		if string(kv.Key) == key {
-			return int(kv.Value.AsInt64())
-		}
-	}
-	return 0
+	return sdktrace.Event{}, false
 }
 
 // 上游 4xx 直通（401/403/429 未配 failover）时的列表文案与正文上报。

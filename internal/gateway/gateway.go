@@ -105,17 +105,31 @@ type state struct {
 	proxy string
 	// failedOver 标记本次请求是否发生了故障切换。
 	failedOver bool
-	stream     bool
-	outcome    string
-	ttfb       time.Duration
-	bytesIn    int64
-	bytesOut   int64
-	sseEvents  int64
-	rewrites   int64
-	err        error
+	// attempts 是已记录的失败尝试次数。失败现场落在 span 属性上会互相
+	// 覆盖，本计数让「属性只描述最后一次」这件事在看板上可判（见
+	// obs.AttrAttemptCount）。单请求内串行递增，无需加锁。
+	attempts  int
+	stream    bool
+	outcome   string
+	ttfb      time.Duration
+	bytesIn   int64
+	bytesOut  int64
+	sseEvents int64
+	rewrites  int64
+	err       error
 	// mx 是本次请求实际使用的指标集合。命中 EXCLUDED_URLS 时它是空集合，
 	// 所有上报退化为 no-op —— 排除判断只在 ServeHTTP 入口做一次。
 	mx *obs.Metrics
+}
+
+// nextAttempt 递增并返回失败尝试序号（首次为 1）。
+//
+// 收成一个方法而不在各调用点写 st.attempts++：失败上报散在 gateway.go 与
+// failover.go 的六处，漏掉任何一处都会让计数偏小，而计数偏小的表现是
+// 「看板显示只失败过一次」—— 与真的只失败一次完全同形，无从发现。
+func (st *state) nextAttempt() int {
+	st.attempts++
+	return st.attempts
 }
 
 // modelOther 是未声明模型在指标里的归一值。
@@ -282,7 +296,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
 			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
 			// 完全不可见，上游某个模型静默挂掉也无人发现。
-			obs.RecordAttemptFailure(span, "transport", failedModel, ureq.URL.Path, 0, err)
+			obs.RecordAttemptFailure(span, "transport", failedModel, ureq.URL.Path, 0, st.nextAttempt(), err)
 			resp, cancel, err = r2, c2, nil
 			st.applyPlan(plan)
 			// 事件之外再落一份 span 属性：事件属性在 trace 列表和筛选里

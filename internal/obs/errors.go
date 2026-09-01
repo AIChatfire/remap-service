@@ -98,12 +98,36 @@ const (
 	// 本键在所有上游响应（成功或失败）后都写入，是更通用的诊断维度。
 	AttrUpstreamStatus = "gateway.upstream.status_code"
 
+	// AttrAttemptCount 是本次请求内失败尝试的总次数。
+	//
+	// 失败现场改用 span 属性承载后（见 RecordAttemptFailure 的注释），多次
+	// 失败会互相覆盖，属性描述的只是**最后一次**。本键让覆盖这件事可见：
+	// count > 1 表示前面还有被盖掉的失败，此时不能把属性读成「只失败过一次」。
+	// 没有它，「第一次 429、第二次 503」与「只有一次 503」在看板上完全同形。
+	AttrAttemptCount = "gateway.attempt.count"
+
+	// 失败尝试的现场维度。stage 取 transport/status/rewrite/build ——
+	// 「上游拒了」与「网关自己没把重试请求发出去」排查方向完全不同。
+	//
+	// 键名集中在此，不散在调用点：曾因 grep 不到无前缀的键名，
+	// 出现过文档里怎么填都不生效且不报错的情况。
+	AttrAttemptStage     = "gateway.attempt.stage"
+	AttrAttemptModel     = "gateway.attempt.model"
+	AttrAttemptStatus    = "gateway.attempt.status_code"
+	AttrAttemptBody      = "gateway.attempt.error_body"
+	AttrAttemptBodySize  = "gateway.attempt.error_body_size"
+	AttrAttemptBodyTrunc = "gateway.attempt.error_truncated"
+
 	// AttrLogfireMsg 覆盖 Logfire 记录在列表里渲染出来的文案。
 	//
 	// 只对 span 本身有效，**对 span event 无效**：事件行恒显示静态事件名，
 	// 写了也不渲染，且 logfire.* 属性会被 Logfire 消费、不出现在 Attributes
 	// 面板里 —— 于是「写了没生效」和「没写」在 UI 上完全同形，白耗一个属性。
-	// 事件要在列表上可辨识，靠的是 AttrLogfireLevel 抬等级，不是本键。
+	//
+	// 这条约束正是本项目不再用 span event 记录失败尝试的原因：event 在
+	// trace 列表里占一整行却改不掉文案，父 span 已写明
+	// "→ 200 (upstream ... → 429)" 时，下面那行 gateway.attempt_failed
+	// 是纯噪音。失败现场改由 RecordAttemptFailure 写进 span 属性。
 	//
 	// 只在信息确实与默认渲染不同时才写，且注意 Logfire 会在文案末尾自动
 	// 追加 http.response.status_code —— 自己再写一遍最终状态码会出现
@@ -335,8 +359,17 @@ func RecordGatewayError(span trace.Span, kind, clientMsg string, err error) {
 // 必须留痕 —— 「为什么老在走兜底模型」只能从这里看出来，否则首次失败
 // 的原因（配额耗尽？该模型下线了？）被彻底丢弃。
 //
-// 用 span 事件而非属性承载：一次请求可能有多次尝试，属性会互相覆盖，
-// 事件天然可重复且带各自的时间戳。
+// 用 span 属性而非事件承载。事件本来更合适（可重复、带独立时间戳），但
+// Logfire 把每条 event 渲染成 trace 列表里的独立一行，而 event 行的文案
+// **改不掉**（logfire.msg 对 event 无效，恒显示静态事件名
+// "gateway.attempt_failed"）。结果父 span 那行已经写明
+// "→ 200 (upstream ... → 429)"，下面却多挂一行毫无信息量的
+// gateway.attempt_failed —— 噪音换不来任何东西。
+//
+// 代价是**属性会互相覆盖**：一次请求内 status 失败后若紧接 rewrite/build/
+// transport 失败，后者会盖掉前者。用 AttrAttemptCount 让覆盖这件事本身可见 ——
+// count > 1 说明前面还有被盖掉的失败，此时属性描述的是**最后一次**。
+// 不用 count 就会把「第一次 429、第二次 503」误读成只失败过一次。
 //
 // stage 说明失败发生在重试的哪一步（rewrite / build / transport / status），
 // 定位「切换本身没生效」时是第一手线索。
@@ -348,21 +381,29 @@ func RecordGatewayError(span trace.Span, kind, clientMsg string, err error) {
 // errOrBody 可以是 Go error（transport / build 阶段）或 []byte 错误正文
 // （status 阶段，此时上游返回了 4xx/5xx 响应体）。status 阶段必须传正文：
 // 429/503 的具体原因（配额类型、剩余额度、建议等待时间）全在正文里。
-func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status int, errOrBody interface{}) {
+//
+// attempt 是本次请求内第几次失败（从 1 起）。由调用方持有计数而不在此处
+// 累加：本函数保持无状态才能被并发请求共用，且计数落在 state 上与其余
+// 请求级字段同源。
+func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status, attempt int, errOrBody interface{}) {
 	if span == nil || !span.IsRecording() {
 		return
 	}
-	// 容量含末尾的 logfire.msg，少算一个就会在失败路径上多一次切片扩容。
-	attrs := make([]attribute.KeyValue, 0, 11)
-	attrs = append(attrs, attribute.String("gateway.attempt.stage", stage))
+	// 容量含末尾的 logfire.level_num 与 attempt_count，少算就会在失败路径上
+	// 多一次切片扩容。
+	attrs := make([]attribute.KeyValue, 0, 12)
+	if attempt > 0 {
+		attrs = append(attrs, attribute.Int(AttrAttemptCount, attempt))
+	}
+	attrs = append(attrs, attribute.String(AttrAttemptStage, stage))
 	if model != "" {
-		attrs = append(attrs, attribute.String("gateway.attempt.model", model))
+		attrs = append(attrs, attribute.String(AttrAttemptModel, model))
 	}
 	if urlPath != "" {
 		attrs = append(attrs, attribute.String(AttrUpstreamPath, urlPath))
 	}
 	if status > 0 {
-		attrs = append(attrs, attribute.Int("gateway.attempt.status_code", status))
+		attrs = append(attrs, attribute.Int(AttrAttemptStatus, status))
 	}
 
 	switch v := errOrBody.(type) {
@@ -380,29 +421,33 @@ func RecordAttemptFailure(span trace.Span, stage, model, urlPath string, status 
 	case []byte:
 		if len(v) > 0 {
 			// 上游错误正文，按 UTF-8 截断到合理长度（默认 2KB）。
-			// 不走 RecordErrorBody：它会写 AttrErrBody 等全局属性，
-			// 而事件内的属性必须用带命名空间的键以区分多次尝试。
+			// 不走 RecordErrorBody：它写的 AttrErrBody 表示「返回给客户端
+			// 的那个错误」，而这里是被重试掉的中间失败，混进同一个键会让
+			// failover 成功的请求看起来也带客户端错误正文。
 			const limit = 2048
 			frag, trunc := truncateUTF8(v, limit)
 			attrs = append(attrs,
-				attribute.String("gateway.attempt.error_body", frag),
-				attribute.Int("gateway.attempt.error_body_size", len(v)),
+				attribute.String(AttrAttemptBody, frag),
+				attribute.Int(AttrAttemptBodySize, len(v)),
 			)
 			if trunc {
-				attrs = append(attrs, attribute.Bool("gateway.attempt.error_truncated", true))
+				attrs = append(attrs, attribute.Bool(AttrAttemptBodyTrunc, true))
 			}
 		}
 	}
 
 	// 抬等级到 warn，这是让失败尝试在看板上可筛的唯一手段。
 	//
-	// 不能靠 logfire.msg：那个键对 span event 不渲染（见其注释）。也不能靠
-	// 标红 span：failover 成功时请求对客户端没故障，标红会制造假故障。
-	// 于是默认下这条 429 事件等级是 info，与成功流量完全同级、无从筛出 ——
+	// 不能靠标红 span：failover 成功时请求对客户端没故障，标红会制造假故障。
+	// 于是默认下这条 429 的等级与成功流量完全同级、无从筛出 ——
 	// 「看板上找不到 429」正是这么来的。
+	//
+	// 这里刻意不写 logfire.msg：父 span 的文案由 SetRequestMsg 统一生成
+	// （已含上游路径与真实状态码），此处再写会互相覆盖，且谁最后写谁生效
+	// 取决于调用顺序 —— 那是最难查的一类 bug。
 	attrs = append(attrs, attribute.Int(AttrLogfireLevel, LevelWarn))
 
-	span.AddEvent("gateway.attempt_failed", trace.WithAttributes(attrs...))
+	span.SetAttributes(attrs...)
 }
 
 // AttrProvider 由「自身携带结构化诊断字段」的错误类型实现。
