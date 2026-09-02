@@ -113,6 +113,13 @@ const (
 	// 排查「命中了但映射错了」时必须先知道规则来自哪一层。
 	AttrMappingSource = "gateway.mapping.source"
 
+	// AttrMappingInvalid 是 X-Model-Map 中解析失败的片段原文。
+	//
+	// 只进看板、绝不进对客户端的错误响应：片段可能含真实上游模型名，
+	// 而 X-Model-Map 常由 new-api 这类中间层注入，400 会被原样透传给
+	// 终端用户 —— 正是脱敏要挡掉的形态。客户端只收通用的格式说明。
+	AttrMappingInvalid = "gateway.mapping.invalid"
+
 	// AttrAttemptCount 是本次请求内失败尝试的总次数。
 	//
 	// 失败现场改用 span 属性承载后（见 RecordAttemptFailure 的注释），多次

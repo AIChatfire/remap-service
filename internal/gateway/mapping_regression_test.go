@@ -134,25 +134,40 @@ func TestMappingDecisionOnSpan(t *testing.T) {
 
 // 声明有语法错误时必须 400 拒绝：静默透传会让上游 404，
 // 而「规则写错」与「故意不配」在看板上完全同形。
+//
+// 同时锁定泄露边界：片段原文可能含真实上游模型名，而 X-Model-Map 常由
+// new-api 这类中间层注入、400 会被透传给终端用户 —— 所以片段原文只进
+// 看板（gateway.mapping.invalid），客户端只收通用格式说明。
 func TestMalformedModelMapRejected(t *testing.T) {
 	cases := []struct {
 		name string
 		hdr  string
+		leak string // 客户端响应里绝不能出现的片段内容
 	}{
-		{"缺冒号", "glm*glm-5-2-260617"},
-		{"全角分号粘连", "glm*:g1；deepseek*:d1"},
-		{"全角冒号", "glm*：glm-5-2-260617"},
-		{"缺上游", "glm*:"},
-		{"混合合法与非法", "glm*:ok;garbage"},
+		{"缺冒号", "glm*glm-5-2-260617", "glm-5-2-260617"},
+		{"全角分号粘连", "glm*:g1；deepseek*:d1", "g1"},
+		{"全角冒号", "glm*：glm-5-2-260617", "glm-5-2-260617"},
+		{"缺上游", "glm*:", "glm*"},
+		{"混合合法与非法", "glm*:ok;garbage", "garbage"},
 	}
-	gs, cap := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+	sr := tracetest.NewSpanRecorder()
+	gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[]}`))
 	}, nil)
+	_ = gs // 每个用例独立 fixture，见下；这里只保留合法声明的反向断言
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			resp := post(t, gs, "/v1/chat/completions",
+			// 每个用例独立的 fixture + recorder：共享时 findSpanWithAttr
+			// 会命中前一个用例的 span，断言的对象就错了。
+			caseSR := tracetest.NewSpanRecorder()
+			caseGS, _ := newFixtureWithRecorder(t, caseSR, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[]}`))
+			}, nil)
+
+			resp := post(t, caseGS, "/v1/chat/completions",
 				`{"model":"glm-5.2","messages":[]}`,
 				map[string]string{MapHeader: c.hdr})
 			defer resp.Body.Close()
@@ -163,10 +178,19 @@ func TestMalformedModelMapRejected(t *testing.T) {
 			if !strings.Contains(string(b), MapHeader) {
 				t.Errorf("错误信息应指明 %s 写错了，实际 %s", MapHeader, b)
 			}
+			// 泄露边界：客户端拿到的必须是通用描述，不含片段原文。
+			if strings.Contains(string(b), c.leak) {
+				t.Errorf("客户端响应泄露了片段内容 %q —— %s 由中间层注入时，终端用户会看到真实上游模型名", c.leak, b)
+			}
+			// 看板拿原文：排查需要知道具体哪一段写错了。
+			sp := findSpanWithAttr(t, caseSR, "gateway.mapping.invalid")
+			if got := attrString(sp, "gateway.mapping.invalid"); !strings.Contains(got, c.leak) {
+				t.Errorf("看板应记录片段原文（含 %q），实际 %q", c.leak, got)
+			}
 		})
 	}
 
-	// 反向：完全合法的生产 Header 不受影响。
+	// 反向：完全合法的生产 Header 不受影响，也不产生 invalid 记录。
 	t.Run("合法声明不受影响", func(t *testing.T) {
 		resp := post(t, gs, "/v1/chat/completions",
 			`{"model":"glm-5.2","messages":[]}`,
@@ -175,9 +199,10 @@ func TestMalformedModelMapRejected(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("合法声明应 200，实际 %d", resp.StatusCode)
 		}
-		_, body, _ := cap.snapshot()
-		if !strings.Contains(string(body), "glm-5-2-260617") {
-			t.Errorf("上游应收到改写后的模型名，实际 %s", body)
+		for _, s := range sr.Ended() {
+			if hasAttr(s, "gateway.mapping.invalid") {
+				t.Error("合法声明不应记录 gateway.mapping.invalid")
+			}
 		}
 	})
 }

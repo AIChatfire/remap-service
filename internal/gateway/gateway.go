@@ -407,8 +407,12 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 	// 客户端只看到「模型不存在」，与「规则写错了」在看板上完全同形。
 	if bad := table.Invalid(); len(bad) > 0 {
 		st.outcome = "bad_model_map"
-		msg := "invalid " + MapHeader + " segment(s): " + strings.Join(bad, ", ") +
-			"; expected <public>:<upstream>[;...]"
+		// 片段原文只进看板，不进对客户端的错误响应：片段可能含真实上游
+		// 模型名（如缺冒号时的 glm*glm-5-2-260617），而 X-Model-Map 常由
+		// new-api 这类中间层注入，400 会被原样透传给终端用户 —— 正是
+		// 脱敏要挡掉的「真实上游名进对外响应」。客户端只收通用格式说明。
+		span.SetAttributes(attribute.String(obs.AttrMappingInvalid, strings.Join(bad, "; ")))
+		msg := "invalid " + MapHeader + " header; expected format: <public>:<upstream>[;...]"
 		obs.RecordGatewayError(span, st.outcome, msg, nil)
 		return writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 	}
