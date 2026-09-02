@@ -401,7 +401,17 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 	st.publicModel = pub
 	st.stream = protocol.IsStream(*body)
 
-	table := g.resolveTable(r)
+	table, tableSrc := g.resolveTable(r)
+	// 声明本身有语法错误时直接拒绝，不再让写错的规则静默退化成透传。
+	// 透传的后果是上游收到对外模型名报 404，而 404 不在 failover 状态集里，
+	// 客户端只看到「模型不存在」，与「规则写错了」在看板上完全同形。
+	if bad := table.Invalid(); len(bad) > 0 {
+		st.outcome = "bad_model_map"
+		msg := "invalid " + MapHeader + " segment(s): " + strings.Join(bad, ", ") +
+			"; expected <public>:<upstream>[;...]"
+		obs.RecordGatewayError(span, st.outcome, msg, nil)
+		return writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
+	}
 	// 指标标签只接受声明过的模型名，其余归一，防止基数爆炸。
 	if table.Declared(pub) || g.static.Declared(pub) {
 		st.metricModel = pub
@@ -414,8 +424,17 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 	// 全局通配与兜底规则配在环境变量里，两者应当叠加而非互相屏蔽。
 	if !ok && table != g.static {
 		up, kind, ok = g.static.LookupKind(pub)
+		tableSrc = mapSourceStatic
 	}
 	st.matchKind = kind
+
+	// 映射决策恒进 span 属性：结果（gateway.upstream.model）不符预期时，
+	// 第一问就是「命中了哪条规则、来自哪层表」。none + 透传的形态必须
+	// 能在看板直接筛出来，不能只活在内部日志里。
+	span.SetAttributes(
+		attribute.String(obs.AttrMappingMatch, kind.String()),
+		attribute.String(obs.AttrMappingSource, tableSrc),
+	)
 
 	switch {
 	case ok:
@@ -557,14 +576,25 @@ func (g *Gateway) readBody(r *http.Request) ([]byte, error) {
 	return b, nil
 }
 
+// 映射表来源，进 span 属性 gateway.mapping.source。
+const (
+	mapSourceHeader = "header"
+	mapSourceStatic = "static"
+)
+
 // resolveTable 优先使用 Header 下发的映射，缺失时回落到静态配置。
-func (g *Gateway) resolveTable(r *http.Request) *mapping.Table {
+//
+// Header 存在但**解析后完全为空**时不再静默回落静态表：那几乎必然是
+// 整串写错了（比如分隔符用错）。返回带 invalid 标记的表，由调用方拒绝。
+// 只有 Header 缺失或为空串才回落静态表。
+func (g *Gateway) resolveTable(r *http.Request) (*mapping.Table, string) {
 	if raw := r.Header.Get(MapHeader); raw != "" {
-		if t := g.mapCache.Get(raw); !t.Empty() {
-			return t
+		t := g.mapCache.Get(raw)
+		if !t.Empty() || len(t.Invalid()) > 0 {
+			return t, mapSourceHeader
 		}
 	}
-	return g.static
+	return g.static, mapSourceStatic
 }
 
 func (g *Gateway) log(st *state, status int, r *http.Request) {

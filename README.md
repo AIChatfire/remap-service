@@ -165,7 +165,15 @@ MODEL_MAP=claude-3-5-*=v3-specific;claude-*=v3-generic;*-flash=lite;*=v3
 | `gemini-flash` | `*-flash` | `wildcard` |
 | `totally-unknown-xyz` | 兜底 | `fallback` |
 
-命中级别写进日志的 `match` 字段，便于确认规则是否按预期生效。
+命中级别写进日志的 `match` 字段与 trace 的 `gateway.mapping.match` 属性
+（`exact` / `wildcard` / `fallback` / `none`），规则来源写在
+`gateway.mapping.source`（`header` / `static`），便于在看板直接确认规则是否按预期生效
+—— `none` 即「未命中、原样透传」，正是排查上游 404 时第一个要筛的形态。
+
+**声明写错直接 400**：`X-Model-Map` 中任何片段解析失败（缺冒号、缺一侧、
+含全角分号/冒号等非 ASCII 字符）都会让请求被拒绝，错误信息带上写错的片段原文。
+不做静默跳过 —— 写错的规则退化成透传时，上游会收到对外模型名并报 404，
+而那与「故意不配映射」在结果上完全同形，无从排查。
 
 ### 兜底与故障切换
 

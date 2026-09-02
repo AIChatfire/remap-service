@@ -23,6 +23,18 @@ type Table struct {
 	wild []wildRule
 	// fallback 是全部规则都未命中时的兜底上游模型。
 	fallback []string
+	// invalid 是解析失败的原始片段。非空表示声明本身有语法错误，
+	// 网关应拒绝请求而不是让写错的规则静默退化成透传 ——
+	// 透传意味着上游收到对外模型名，报 404 时看板上只剩结果查不到原因。
+	invalid []string
+}
+
+// Invalid 返回解析失败的原始片段（每条已截断，最多保留 maxInvalid 条）。
+func (t *Table) Invalid() []string {
+	if t == nil {
+		return nil
+	}
+	return t.invalid
 }
 
 // wildRule 是一条通配规则及其目标上游列表。
@@ -166,8 +178,18 @@ func (t *Table) LookupFallback() (upstream string, kind MatchKind, ok bool) {
 	return pick(t.fallback), MatchFallback, true
 }
 
+// maxInvalid 限制记录的非法片段条数与单条长度：
+// 该内容会进错误响应与看板，防御恶意超长 Header 撑爆属性。
+const (
+	maxInvalid    = 4
+	maxInvalidLen = 64
+)
+
 // Parse 解析 X-Model-Map 头的原始值。
-// 非法片段（缺少冒号、任一侧为空）被静默跳过，保证单条错误不影响整体。
+//
+// 非法片段（缺少冒号、任一侧为空）不再静默跳过，而是记入 Table.invalid，
+// 由网关层拒绝请求。此前的静默跳过策略让写错的规则退化成「未命中 → 透传」，
+// 上游收到对外模型名报 404，而看板上完全看不出是声明写错了。
 //
 // 对外模型名可含 `*` 通配（如 `claude-*:claude-3-5-sonnet`）。
 func Parse(raw string) *Table {
@@ -175,6 +197,16 @@ func Parse(raw string) *Table {
 		return &Table{}
 	}
 	m := make(map[string][]string, 8)
+	var invalid []string
+	bad := func(seg string) {
+		if len(invalid) >= maxInvalid {
+			return
+		}
+		if len(seg) > maxInvalidLen {
+			seg = seg[:maxInvalidLen] + "..."
+		}
+		invalid = append(invalid, seg)
+	}
 	for len(raw) > 0 {
 		var seg string
 		if i := strings.IndexByte(raw, ';'); i >= 0 {
@@ -183,21 +215,40 @@ func Parse(raw string) *Table {
 			seg, raw = raw, ""
 		}
 		if seg = strings.TrimSpace(seg); seg == "" {
-			continue
+			continue // 允许尾随 / 连续分号，空片段无歧义
 		}
-		// 从右往左找冒号：对外模型名不含冒号，上游模型名理论上可能含（如 ep:xxx）。
+		// 从左往右找冒号：对外模型名不含冒号，上游模型名理论上可能含（如 ep:xxx）。
 		i := strings.IndexByte(seg, ':')
 		if i <= 0 || i == len(seg)-1 {
+			bad(seg)
 			continue
 		}
 		pub := strings.TrimSpace(seg[:i])
 		up := strings.TrimSpace(seg[i+1:])
-		if pub == "" || up == "" {
+		if pub == "" || up == "" || !validToken(pub) || !validToken(up) {
+			bad(seg)
 			continue
 		}
 		m[pub] = append(m[pub], up)
 	}
-	return build(m, nil)
+	t := build(m, nil)
+	t.invalid = invalid
+	return t
+}
+
+// validToken 报告模型名/规则名是否只含可打印 ASCII。
+//
+// 模型名实践中都是 ASCII 标识符。放行非 ASCII 会让全角分号（；）、全角
+// 冒号（：）这类肉眼难辨的字符把两条规则粘成一条「看似合法」的规则 ——
+// 结果是映射到一个不存在的超长模型名，或整段声明静默失效。
+// 这类书写错误必须在解析期就拒绝，而不是等上游 404。
+func validToken(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x20 || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // FromStatic 由静态配置构建映射表（Header 缺失时的兜底）。

@@ -98,6 +98,21 @@ const (
 	// 本键在所有上游响应（成功或失败）后都写入，是更通用的诊断维度。
 	AttrUpstreamStatus = "gateway.upstream.status_code"
 
+	// AttrMappingMatch 是模型映射的命中级别（exact/wildcard/fallback/none）。
+	//
+	// 「上游收到了错误的模型名」这类问题的第一问永远是：网关到底命中了
+	// 哪条规则？此前该信息只进内部日志（match=...），看板上只有映射的
+	// **结果**（gateway.upstream.model）而没有**决策过程**，一旦结果不符
+	// 预期就只能去翻服务器日志。none 表示未命中任何规则、请求被原样透传
+	// —— 正是「写错通配符导致上游 404」的形态，必须能在看板直接筛出来。
+	AttrMappingMatch = "gateway.mapping.match"
+
+	// AttrMappingSource 是映射表的来源（header/static）。
+	//
+	// Header 表与静态表叠加生效，同一个模型名在两边可能都有规则。
+	// 排查「命中了但映射错了」时必须先知道规则来自哪一层。
+	AttrMappingSource = "gateway.mapping.source"
+
 	// AttrAttemptCount 是本次请求内失败尝试的总次数。
 	//
 	// 失败现场改用 span 属性承载后（见 RecordAttemptFailure 的注释），多次
