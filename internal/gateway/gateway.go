@@ -435,9 +435,13 @@ func (g *Gateway) rewrite(w http.ResponseWriter, r *http.Request, st *state, bod
 	// 映射决策恒进 span 属性：结果（gateway.upstream.model）不符预期时，
 	// 第一问就是「命中了哪条规则、来自哪层表」。none + 透传的形态必须
 	// 能在看板直接筛出来，不能只活在内部日志里。
+	//
+	// header_present 单独记录：source=static 分不开「注入层没发头」与
+	// 「头到了但未命中回落」两种成因，偶发透传事故必须先分清这一层。
 	span.SetAttributes(
 		attribute.String(obs.AttrMappingMatch, kind.String()),
 		attribute.String(obs.AttrMappingSource, tableSrc),
+		attribute.Bool(obs.AttrMappingHeaderPresent, r.Header.Get(MapHeader) != ""),
 	)
 
 	switch {

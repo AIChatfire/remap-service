@@ -196,6 +196,7 @@ func Parse(raw string) *Table {
 	if strings.TrimSpace(raw) == "" {
 		return &Table{}
 	}
+	orig := raw
 	m := make(map[string][]string, 8)
 	var invalid []string
 	bad := func(seg string) {
@@ -230,6 +231,14 @@ func Parse(raw string) *Table {
 			continue
 		}
 		m[pub] = append(m[pub], up)
+	}
+	// 整串既没有产出任何规则、也没有任何非法片段，说明 raw 只由分隔符
+	// 与空白组成（";"、" ; ; " 等）——几乎必然是注入层模板把空规则集
+	// 渲染成了残留分隔符，而不是「故意不配」。静默回落静态表会让这种
+	// 写错退化成透传（上游收到对外名 404），与 resolveTable 的契约
+	//（只有 Header 缺失或空串才回落）冲突。按非法声明记录，由网关拒绝。
+	if len(m) == 0 && len(invalid) == 0 {
+		bad(strings.TrimSpace(orig))
 	}
 	t := build(m, nil)
 	t.invalid = invalid

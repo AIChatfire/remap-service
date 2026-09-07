@@ -106,6 +106,11 @@ func TestParseRecordsInvalidSegments(t *testing.T) {
 		{"全角冒号", "glm*：g1", 1},                // ：是 U+FF1A，找不到 ASCII 冒号
 		{"空片段合法", "a:b;;c:d;", 0},
 		{"条数上限", "x;y;z;w;v;u", maxInvalid},
+		// 只有分隔符/空白的串必须判非法：注入层模板渲染出空规则集时
+		// 的典型残留形态。静默回落静态表会退化成透传（上游 404），
+		// 且与「故意不发头」在看板上同形。
+		{"仅分隔符", ";", 1},
+		{"仅分隔符与空白", " ; ; ", 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -113,6 +113,16 @@ const (
 	// 排查「命中了但映射错了」时必须先知道规则来自哪一层。
 	AttrMappingSource = "gateway.mapping.source"
 
+	// AttrMappingHeaderPresent 报告本次请求是否携带了非空的 X-Model-Map 头。
+	//
+	// source=static 有两种完全不同的成因：① 注入层（new-api 渠道配置等）
+	// 根本没把头发过来；② 头来了但请求的模型未命中任何 Header 规则、
+	// 回落到了静态表。两者的排查方向相反 —— 前者查注入层配置，后者查
+	// 规则本身。此前两种形态在看板上同形（2026-09-07 偶发 404 事故：
+	// 每条失败 trace 都是 source=static + match=none，只能靠「Header 若在
+	// 必命中」反推出头没到达）。本属性让这个反推变成直接证据。
+	AttrMappingHeaderPresent = "gateway.mapping.header_present"
+
 	// AttrMappingInvalid 是 X-Model-Map 中解析失败的片段原文。
 	//
 	// 只进看板、绝不进对客户端的错误响应：片段可能含真实上游模型名，

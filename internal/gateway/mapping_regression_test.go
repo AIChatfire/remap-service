@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/betterme/remap-service/internal/config"
@@ -231,4 +233,93 @@ func TestMappingSourceStaticFallback(t *testing.T) {
 	if got := attrString(sp, "gateway.mapping.source"); got != "static" {
 		t.Errorf("mapping.source = %q，期望 static（回落静态表后来源要跟着换）", got)
 	}
+}
+
+// ---------- 偶发透传事故回归（2026-09-07）----------
+//
+// 线上现象：同一渠道请求偶发 404，失败 trace 一律 source=static +
+// match=none。成因是注入层偶发没把 X-Model-Map 发过来（或渲染成空串），
+// 网关按「Header 缺失」回落静态表 —— 静态表为空则透传，上游收到对外名 404。
+// 两条契约：
+//
+//	① header_present 恒进 span 属性，「头没到」与「头到了但未命中」可分；
+//	② 只含分隔符的 Header 值（";" 等模板残留）按非法声明 400 拒绝，
+//	   不得静默回落静态表。
+
+// header_present 必须能区分「注入层没发头」与「发了但未命中」。
+func TestMappingHeaderPresenceOnSpan(t *testing.T) {
+	newGS := func(sr *tracetest.SpanRecorder) *httptest.Server {
+		gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"choices":[]}`))
+		}, nil)
+		return gs
+	}
+
+	t.Run("无 Header 透传", func(t *testing.T) {
+		sr := tracetest.NewSpanRecorder()
+		resp := post(t, newGS(sr), "/v1/chat/completions",
+			`{"model":"glm-5.1","messages":[]}`, nil)
+		defer resp.Body.Close()
+
+		sp := findSpanWithAttr(t, sr, "gateway.mapping.header_present")
+		if attrBoolValue(sp, "gateway.mapping.header_present") {
+			t.Error("未携带 X-Model-Map 时 header_present 应为 false")
+		}
+		if got := attrString(sp, "gateway.mapping.source"); got != "static" {
+			t.Errorf("mapping.source = %q，期望 static", got)
+		}
+	})
+
+	t.Run("有 Header 未命中回落", func(t *testing.T) {
+		sr := tracetest.NewSpanRecorder()
+		resp := post(t, newGS(sr), "/v1/chat/completions",
+			`{"model":"totally-unknown","messages":[]}`,
+			map[string]string{MapHeader: "other-*:up"})
+		defer resp.Body.Close()
+
+		sp := findSpanWithAttr(t, sr, "gateway.mapping.header_present")
+		if !attrBoolValue(sp, "gateway.mapping.header_present") {
+			t.Error("携带了 X-Model-Map 时 header_present 应为 true —— 与「注入层没发头」必须可分")
+		}
+		if got := attrString(sp, "gateway.mapping.source"); got != "static" {
+			t.Errorf("mapping.source = %q，期望 static", got)
+		}
+	})
+}
+
+// 只含分隔符的 Header 值是注入层模板渲染空规则集的典型残留，
+// 必须 400 拒绝，不得静默回落成透传。
+func TestSeparatorOnlyModelMapRejected(t *testing.T) {
+	for _, hdr := range []string{";", " ; ; "} {
+		t.Run("hdr="+hdr, func(t *testing.T) {
+			gs, cap := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"choices":[]}`))
+			}, nil)
+
+			resp := post(t, gs, "/v1/chat/completions",
+				`{"model":"glm-5.1","messages":[]}`,
+				map[string]string{MapHeader: hdr})
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("仅分隔符的声明应 400，实际 %d —— 静默回落正是偶发透传 404 的形态", resp.StatusCode)
+			}
+			// 上游一个字节都不该收到。
+			if p, _, _ := cap.snapshot(); p != "" {
+				t.Errorf("请求不应到达上游，实际打到了 %s", p)
+			}
+		})
+	}
+}
+
+// attrBoolValue 读取布尔属性的取值；属性不存在时返回 false。
+// 「存在性」由调用方先用 findSpanWithAttr 保证。
+func attrBoolValue(s sdktrace.ReadOnlySpan, key string) bool {
+	for _, kv := range s.Attributes() {
+		if string(kv.Key) == key {
+			return kv.Value.AsBool()
+		}
+	}
+	return false
 }
