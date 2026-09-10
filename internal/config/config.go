@@ -54,8 +54,34 @@ type Upstream struct {
 	// 否则本地 mock 上游联调会被打进代理。
 	NoProxy string
 
-	Timeout          time.Duration
+	// Timeout 是**非流式**请求的总时长上限。
+	Timeout time.Duration
+	// StreamTimeout 是**流式**请求的总时长上限。
+	//
+	// 流式正常由客户端断开或上游 EOF 结束，这里只是一个兜底，防止连接泄漏。
+	// 它必须是配置项：早期实现把 30 分钟硬编码在 Client.Do 里，导致无论
+	// 怎么调 UPSTREAM_TIMEOUT 都压不动流式请求。
+	StreamTimeout time.Duration
+	// FirstByteTimeout 是**流式**请求等待响应头的时间上限。
+	//
+	// 绝大多数上游在首个 token 就绪前不发响应头，因此它实际约等于 TTFT。
 	FirstByteTimeout time.Duration
+	// FirstByteTimeoutNonStream 是**非流式**请求等待响应头的时间上限。
+	//
+	// 与流式那个的语义完全不同：非流式上游要先跑完整段生成才发响应头，
+	// 所以它实质上是「整段生成时长」的上限。两者必须分开配 —— 共用一个值
+	// 只能二选一地错：按 TTFT 的量级设会误杀 60s 以上的正常长生成，
+	// 按生成时长的量级设则流式的异常永远检测不出来。
+	FirstByteTimeoutNonStream time.Duration
+	// StallTimeout 是流式响应**两个数据块之间**的最大间隔，0 表示关闭。
+	//
+	// 它覆盖的是首字节与总超时都管不到的形态：响应头已到、流已建立，
+	// 但上游中途不再吐数据。没有它，这样的流会一直挂到 StreamTimeout
+	// （默认 30 分钟），期间占着并发名额、连接与请求体内存。
+	//
+	// 默认关闭而非拍一个默认值：「多长算卡住」强依赖上游形态，部分上游
+	// 在长时间推理期间确实一个字节都不发，设小了会误杀正常请求。
+	StallTimeout time.Duration
 }
 
 // Mapping 控制模型映射。
@@ -99,8 +125,18 @@ type Limits struct {
 	MaxConns int
 	// MaxInflight 是同时在途的请求数上限，超出即返回 503。
 	// 0 表示不限制（仅在网关前已有可靠的并发控制时才建议这样配）。
-	MaxInflight      int
-	MaxBodyBytes     int64
+	MaxInflight int
+	// MaxBodyBytes 是入站请求体的内存上限，超出返回 400。
+	MaxBodyBytes int64
+	// MaxSanitizeBytes 是「需要脱敏的响应」能占用的内存上限。
+	//
+	// 超出即返回 400，**不做原文直通**：直通会让上游真实标识（响应里的
+	// model / id、错误正文里的真实模型名）未经处理就落到客户端，而脱敏
+	// 存在的全部理由就是挡这个。一次明确的失败可观测、可重现；
+	// 一次静默的泄漏不是。
+	//
+	// 不需要脱敏的响应（脱敏关闭、或本次请求没有 model 字段）不受此限，
+	// 对它们它只是防大响应打爆内存的护栏。
 	MaxSanitizeBytes int64
 }
 
@@ -171,9 +207,15 @@ func Load(envFile string) (*Config, error) {
 			Proxy:            strings.TrimSpace(envStr("UPSTREAM_PROXY", "")),
 			AllowProxyHeader: envBool("UPSTREAM_PROXY_FROM_HEADER", false),
 			NoProxy:          strings.TrimSpace(envStr("UPSTREAM_NO_PROXY", "localhost,127.0.0.1,::1")),
-			Timeout:          envDur("UPSTREAM_TIMEOUT", 120*time.Second),
+			Timeout:          envDur("UPSTREAM_TIMEOUT", 600*time.Second),
+			StreamTimeout:    envDur("UPSTREAM_STREAM_TIMEOUT", 30*time.Minute),
 			FirstByteTimeout: envDur("UPSTREAM_FIRST_BYTE_TIMEOUT", 30*time.Second),
-			Protocols:        loadProtocolBases(),
+			// 非流式的响应头要等整段生成跑完，必须比流式那个宽松一个量级。
+			FirstByteTimeoutNonStream: envDur("UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM", 300*time.Second),
+			// 默认 0 = 关闭。envDur 对 0 与未设置同样返回默认值，
+			// 而这里默认值就是 0，因此两种写法都落到「关闭」，符合预期。
+			StallTimeout: envDur("UPSTREAM_STALL_TIMEOUT", 0),
+			Protocols:    loadProtocolBases(),
 		},
 		Mapping: Mapping{
 			Strict:          envBool("MODEL_MAP_STRICT", false),
@@ -334,6 +376,15 @@ func (c *Config) Summary() []any {
 		// 仅 scheme://host：代理 URL 的 userinfo 段常带密码。
 		"upstream_proxy", orNone(proxyurl.Redact(c.Upstream.Proxy)),
 		"proxy_from_header", c.Upstream.AllowProxyHeader,
+		// 超时值全部进启动日志：这几个键此前只能靠「行为不像预期」反推，
+		// 而改错了键名不会有任何报错。
+		"timeout", c.Upstream.Timeout.String(),
+		"stream_timeout", c.Upstream.StreamTimeout.String(),
+		"first_byte_timeout", c.Upstream.FirstByteTimeout.String(),
+		"first_byte_timeout_nonstream", c.Upstream.FirstByteTimeoutNonStream.String(),
+		"stall_timeout", c.Upstream.StallTimeout.String(),
+		"max_inflight", c.Limits.MaxInflight,
+		"max_body_bytes", c.Limits.MaxBodyBytes,
 		"sanitize", c.SanitizeEnabled(),
 		"strict_mapping", c.Mapping.Strict,
 		"obs", c.Obs.Enabled,

@@ -12,13 +12,18 @@ import (
 var allEnvKeys = []string{
 	"ADDR", "UPSTREAM_BASE", "UPSTREAM_KEY", "UPSTREAM_BASE_FROM_HEADER",
 	"UPSTREAM_TIMEOUT", "UPSTREAM_FIRST_BYTE_TIMEOUT",
+	"UPSTREAM_STREAM_TIMEOUT", "UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM",
+	"UPSTREAM_STALL_TIMEOUT",
+	"UPSTREAM_PROXY", "UPSTREAM_PROXY_FROM_HEADER", "UPSTREAM_NO_PROXY",
 	"UPSTREAM_BASE_OPENAI", "UPSTREAM_BASE_RESPONSES", "UPSTREAM_BASE_ANTHROPIC",
-	"MODEL_MAP", "MODEL_MAP_STRICT",
+	"MODEL_MAP", "MODEL_MAP_STRICT", "MODEL_MAP_FALLBACK", "MODEL_MAP_FAILOVER",
+	"MODEL_CAPABILITY",
 	"SANITIZE_OFF", "SANITIZE_ALIASES", "SANITIZE_REPLACE",
 	"SANITIZE_DROP_HEADERS", "SANITIZE_MAX_VALUE_LEN",
-	"MAX_CONNS", "MAX_BODY_BYTES", "MAX_SANITIZE_BYTES",
+	"MAX_CONNS", "MAX_INFLIGHT", "MAX_BODY_BYTES", "MAX_SANITIZE_BYTES",
 	"OBS_ENABLED", "OBS_SERVICE_NAME", "OBS_ENV", "OBS_SAMPLE_RATIO",
-	"LOGFIRE_TOKEN", "LOGFIRE_REGION",
+	"LOGFIRE_TOKEN", "LOGFIRE_REGION", "OBS_ERROR_BODY_BYTES",
+	"OBS_METRIC_INTERVAL", "EXCLUDED_URLS", "TRUSTED_PROXY_HOPS",
 	"LOG_LEVEL", "LOG_FORMAT", "LOG_UPSTREAM_MODEL",
 }
 
@@ -109,8 +114,26 @@ func TestDefaults(t *testing.T) {
 	if c.Addr != ":8080" {
 		t.Errorf("addr = %q", c.Addr)
 	}
-	if c.Upstream.Timeout != 120*time.Second || c.Upstream.FirstByteTimeout != 30*time.Second {
-		t.Errorf("超时默认值错误: %v / %v", c.Upstream.Timeout, c.Upstream.FirstByteTimeout)
+	// 超时是四套独立语义，必须各自有默认值：非流式的「首字节」实际是
+	// 整段生成的上限，要比流式的 TTFT 宽松一个量级。共用一个默认值
+	// 会让其中一边必然错。
+	if c.Upstream.Timeout != 600*time.Second {
+		t.Errorf("UPSTREAM_TIMEOUT 默认值错误: %v", c.Upstream.Timeout)
+	}
+	if c.Upstream.StreamTimeout != 30*time.Minute {
+		t.Errorf("UPSTREAM_STREAM_TIMEOUT 默认值错误: %v", c.Upstream.StreamTimeout)
+	}
+	if c.Upstream.FirstByteTimeout != 30*time.Second {
+		t.Errorf("UPSTREAM_FIRST_BYTE_TIMEOUT 默认值错误: %v", c.Upstream.FirstByteTimeout)
+	}
+	if c.Upstream.FirstByteTimeoutNonStream != 300*time.Second {
+		t.Errorf("UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM 默认值错误: %v",
+			c.Upstream.FirstByteTimeoutNonStream)
+	}
+	// 空闲超时默认关闭：不同上游「多久不出数据算卡住」差异极大，
+	// 替用户拍一个值等于把误杀正常长推理的风险塞进默认配置。
+	if c.Upstream.StallTimeout != 0 {
+		t.Errorf("UPSTREAM_STALL_TIMEOUT 应默认关闭，实际 %v", c.Upstream.StallTimeout)
 	}
 	if !c.Upstream.AllowBaseHeader {
 		t.Error("默认应允许 X-Upstream-Base 覆盖")

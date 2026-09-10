@@ -62,10 +62,16 @@ func testConfig(base string) *config.Config {
 	return &config.Config{
 		Addr: ":0",
 		Upstream: config.Upstream{
-			Base:             base,
-			AllowBaseHeader:  true,
-			Timeout:          30 * time.Second,
-			FirstByteTimeout: 10 * time.Second,
+			Base:            base,
+			AllowBaseHeader: true,
+			// 四个超时都显式给出：非流式的「首字节」是整段生成上限，
+			// 流式的是 TTFT，量级不同；不写清会让用例测到另一个语义上。
+			Timeout:                   30 * time.Second,
+			StreamTimeout:             30 * time.Second,
+			FirstByteTimeout:          10 * time.Second,
+			FirstByteTimeoutNonStream: 10 * time.Second,
+			// 空闲超时默认关闭，用例需要时自行开。
+			StallTimeout: 0,
 		},
 		Sanitize: config.Sanitize{
 			Aliases:     map[string][]string{"deepseek-v3": {"deepseek-v3-250101", "DeepSeek-V3"}},

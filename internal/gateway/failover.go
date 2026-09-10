@@ -198,7 +198,11 @@ func (g *Gateway) retryWithFallback(
 		obs.RecordAttemptFailure(span, "build", plan.model, "", 0, st.nextAttempt(), err)
 		return nil, nil, false
 	}
-	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
+	// 重试自身的分段耗时同样上报。它会在首次尝试的现场上覆盖 ——
+	// 这是有意的：「最后一次尝试卡在哪一段」才是排查切换失败时最直接的
+	// 信息，而首次现场已经由 RecordAttemptFailure 单独留了痕。
+	resp, cancel, timing, err := g.client.Do(ctx, ureq, st.stream)
+	recordUpstreamTiming(span, timing)
 	if err != nil {
 		if cancel != nil {
 			cancel()

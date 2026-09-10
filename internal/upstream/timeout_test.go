@@ -76,7 +76,7 @@ func TestFirstByteTimeoutIsDescriptive(t *testing.T) {
 	defer closeTr()
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
-	_, cancel, err := c.Do(context.Background(), req, false)
+	_, cancel, _, err := c.Do(context.Background(), req, false)
 	cancel()
 
 	var te *TimeoutError
@@ -116,7 +116,7 @@ func TestTotalTimeoutKind(t *testing.T) {
 	defer closeTr()
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
-	resp, cancel, err := c.Do(context.Background(), req, false)
+	resp, cancel, _, err := c.Do(context.Background(), req, false)
 	if err != nil {
 		t.Fatalf("响应头及时返回，Do 不应报错: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestParentDeadlineReportsActualElapsed(t *testing.T) {
 	defer ccl()
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
-	_, cancel, err := c.Do(ctx, req, false)
+	_, cancel, _, err := c.Do(ctx, req, false)
 	cancel()
 
 	var te *TimeoutError

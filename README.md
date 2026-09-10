@@ -366,6 +366,36 @@ SANITIZE_REPLACE=ark.cn-beijing.volces.com=api.internal
 SANITIZE_DROP_HEADERS=X-Tt-Logid,X-Client-Request-Id
 ```
 
+### 超过 `MAX_SANITIZE_BYTES` 时直接 400，不直通
+
+需要脱敏的响应超过上限（默认 16MB）时，网关**返回 400，绝不原文转发**：
+
+```json
+{"error":{"message":"upstream response too large to sanitize (limit 16777216 bytes); …",
+          "type":"invalid_request_error"}}
+```
+
+理由是**一次明确的失败可观测、可重现，一次静默的泄漏不是**。原文直通会在客户端
+毫不知情的情况下把上游真实标识送出去 —— 响应里的 `model` / `id` /
+`system_fingerprint`、错误正文里的真实模型名，全都是脱敏存在的理由。
+
+几个刻意的选择：
+
+- **状态码取 400 而非 5xx。** 上游是正常返回的，是网关基于策略拒绝转发。
+  记成 5xx 会把责任推给上游，让上游侧的错误率被这类请求污染。
+- **上游真实状态码与错误正文仍然上报**（`gateway.upstream.status_code` +
+  `gateway.error.body`），所以换成 400 之后，「上游本来返回了什么」不会丢失，
+  看板上也能把「上游失败」与「网关因过大而拒发」分开筛。
+- **正常响应的正文不上报** —— 那是一段模型生成的内容，既无诊断价值，
+  也不该被搬到看板上。只有上游本身报错时才取一段前缀。
+- **已复制的上游响应头会被清掉**，避免把上游标识（`Server`、各家 logid）
+  挂在一个网关自己产生的 400 上。
+- **只在「本次确实需要脱敏」时生效**：`SANITIZE_OFF=true`，或请求没有 `model`
+  字段时本来就不执行任何替换，不存在泄漏面，此时它只是防大响应打爆内存的
+  护栏，仍然透传 —— 否则会让 `SANITIZE_OFF` 的部署遇到大响应就整类失败。
+
+触发时 span 的 `gateway.error.kind` 为 `response_too_large`，可直接筛。
+
 ---
 
 ## 配置
@@ -383,6 +413,39 @@ SANITIZE_DROP_HEADERS=X-Tt-Logid,X-Client-Request-Id
 - **认证方式不配** —— 由协议决定。
 
 字节数支持 `64MB` / `32mb` / `1048576`，时长支持 `120s` / `2m` / `120`（纯数字按秒）。
+
+### 超时
+
+四条超时覆盖四种**不同的失败形态**，不要用同一个值套：
+
+| 配置项 | 覆盖的现象 | 建议量级 |
+| --- | --- | --- |
+| `UPSTREAM_FIRST_BYTE_TIMEOUT` | 流式：响应头迟迟不来，≈ 首 token 延迟（TTFT） | 30~60s |
+| `UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM` | 非流式：响应头在生成结束后才发，**这就是整段生成的上限** | 3~5min |
+| `UPSTREAM_TIMEOUT` / `UPSTREAM_STREAM_TIMEOUT` | 总时长兜底，按是否流式分开 | 非流式 10min、流式 15~30min |
+| `UPSTREAM_STALL_TIMEOUT` | 响应头已到、流已建立，但上游中途不再吐数据（默认关闭） | 1~3min |
+
+首字节这两项**必须分开配**，因为语义差一个数量级：非流式上游要先跑完整段生成才
+发响应头，按 TTFT 的量级设会误杀正常的长生成；反过来，按生成时长的量级设则流式的
+异常永远检测不出来。共用一个键必然二选一地错。
+
+`UPSTREAM_STALL_TIMEOUT` 覆盖的是前三条都拦不住的形态：一条已经吐了 20 个 token
+然后死掉的流，首字节看门狗早已解除，总超时又要等 30 分钟才生效 —— 中间这段时间它
+一直占着并发名额、一条上游连接、一个 goroutine 和整份请求体内存，而客户端什么都
+收不到。判据是**两个数据块之间的间隔**而不是总时长：持续产出 token 的流间隔恒定很小、
+与总时长无关，所以长回答不会被误杀。
+
+它默认关闭而非拍一个默认值：部分上游在长时间推理期间确实一个字节都不发，设小了会
+误杀正常请求。先观察成功流的 chunk 间隔分布再定。
+
+**取值方法是查分位数，不是拍脑袋**：
+
+```text
+timeout ≈ 分位数(成功耗时, 0.99) × 1.5 ~ 2
+```
+
+分位数只能基于**成功**请求统计。把超时请求算进去会让分布被当前阈值截断，
+下一轮算出更小的值，逐次收紧成死循环。
 
 ### 出网代理
 
@@ -416,7 +479,7 @@ transport，不会每请求新建连接。默认出口（无代理头）走独�
 ### 过载保护
 
 ```bash
-MAX_INFLIGHT=4096    # 同时在途的请求数上限，超出返回 503 + Retry-After
+MAX_INFLIGHT=1024    # 同时在途的请求数上限，超出返回 503 + Retry-After
 ```
 
 这是网关最重要的自保开关。LLM 单请求耗时数十秒，上游一旦变慢，入站请求会持续
@@ -424,13 +487,30 @@ MAX_INFLIGHT=4096    # 同时在途的请求数上限，超出返回 503 + Retry
 与一条上游连接。没有上限时，网关会在上游恢复之前先把自己 OOM 掉，
 并把压力全部传导给已经过载的上游。
 
+**它不是内存护栏。** 它数的是「条数」，而内存按「字节」消耗：单个最坏请求是
+请求体 +（走 failover 时的）请求体副本 + 响应缓冲。它真正的作用有三个 ——
+限制 goroutine / 连接 / 文件描述符，不把超过上游配额的并发压给上游，
+以及过载时快速失败而不是排队。
+
+所以取值是三者取最小：
+
+```text
+MAX_INFLIGHT = min(上游账号并发配额 × 0.8,
+                   CPU 压测拐点 × 0.7,
+                   容器内存 ÷ 平均单请求占用)
+```
+
+**它与超时是乘数关系**：在途数 × 平均时长 = 内存被占用的总时长。长超时配大在途数，
+等于让上游的一次抖动把网关填满十分钟。按 512MB / 2 核的容器估，合理区间在
+512~2048；填 10240 只会在上游变慢时把上万个请求连请求体一起抱在内存里等超时。
+
 闸门在**读取请求体之前**获取：body 一旦读入就已占用内存，此时再拒绝就失去了
 保护意义。超限直接快速失败而不排队 —— 排队只会把延迟累积到客户端超时，
 对已经过载的系统没有帮助。
 
 ```bash
 curl -s localhost:8080/readyz
-# {"status":"ready","inflight":37,"limit":4096}
+# {"status":"ready","inflight":37,"limit":1024}
 ```
 
 `gateway_requests_rejected_total` 持续非零即说明该扩容或调高上限。
@@ -457,6 +537,27 @@ LOGFIRE_REGION=us              # us | eu，须与 token 所属区域一致
 先核对这一项。反向的 `OBS_ENABLED=true` 但缺 token 是硬错误，启动即拦。
 
 高 QPS 下建议 `OBS_SAMPLE_RATIO=0.05`，指标不受采样影响。
+
+### 排障用的 span 属性
+
+每个请求 span 上都有一组字段用于回答「这次为什么慢 / 为什么失败」，
+不必展开事件、也不必回去翻服务器日志：
+
+| 属性 | 回答的问题 |
+| --- | --- |
+| `gateway.upstream.wrote_request_ms` | 请求是什么时候真正交给上游的。**接近超时上限＝卡在本地**（连接池 / h2 流排队 / 代理握手），只有几毫秒＝时间全花在等上游 |
+| `gateway.upstream.dns_ms` / `connect_ms` / `tls_ms` | 这三段各花了多久。复用连接时**不出现**，缺失本身就是信息 |
+| `gateway.upstream.conn_reused` / `proto` | 是否复用连接、实际走 h2 还是 http/1.1 |
+| `gateway.request.bytes` / `response.bytes` | 请求与响应体积（首字节延迟与 prefill 长度强相关） |
+| `gateway.inflight` / `inflight_limit` | 本请求处理期间的在途水位 |
+| `gateway.timeout.kind` | `first_byte` / `total` / `stall` —— 直接指向该调哪个配置项 |
+| `gateway.attempt.count` | 失败尝试次数。恒写，`0` 表示本次没有失败尝试 |
+| `gateway.credential.fingerprint` | 凭据的 8 位哈希前缀，用于按渠道聚合（上游限流按账号计） |
+| `gateway.request.id` | 客户端传入的 `X-Request-Id`。超时拿不到上游 logid，这是跨系统串联的唯一把手 |
+
+两点约定：`gateway.request.id` 只在客户端提供了才写（网关自己生成的 ID 客户端
+并不知道，串不起任何东西）；`gateway.credential.fingerprint` 只落哈希前缀，
+绝不落凭据原文。
 
 **指标**（低基数，标签仅 `route` / `model` / `outcome` / `status`）：
 
@@ -559,7 +660,7 @@ internal/protocol   协议注册表（路径识别 + 字段路径）、JSON 脱�
 internal/config     .env 解析、环境变量取值、校验
 internal/mapping    X-Model-Map 解析、通配规则、分片缓存、随机分流、兜底
 internal/sanitize   替换器构建与缓存、长度阈值、生成内容字段白名单
-internal/upstream   连接池、首字节超时看门狗
+internal/upstream   连接池、超时看门狗（首字节/总时长/空闲）、httptrace 耗时埋点
 internal/gateway    代理核心：闸门 → 协议识别 → 凭据透传 → 改写 → 转发 → 脱敏
                     gate.go 并发闸门，failover.go 故障切换
 internal/server     路由、panic 恢复、优雅退出
@@ -629,17 +730,23 @@ gateway_requests_inflight
 ## 运维要点
 
 1. **过载保护** —— `MAX_INFLIGHT` 是最重要的一个值。盯住
-   `gateway_requests_rejected_total`，持续非零就该扩容或调高上限。
-2. **超时** —— 非流式 `UPSTREAM_TIMEOUT` 120s；`UPSTREAM_FIRST_BYTE_TIMEOUT` 30s 只约束响应头到达前，
-   流式连接建立后不再受其影响（有测试覆盖这条竞态）。
+   `gateway_requests_rejected_total`，持续非零就该扩容或调高上限；
+   但调高之前先确认上游真的吃得下，否则只是把 503 换成更晚的 OOM。
+2. **超时** —— 四套语义分开配，见[超时](#超时)。改完先看「超时数量是否变化」：
+   若数量基本不变，说明那就是上游的真实延迟水平，方向要转向选模型 / 换上游 / 加容量，
+   而不是继续调网关。**判断超时归属先看 `gateway.upstream.wrote_request_ms`** ——
+   它接近超时上限说明请求压根没发出去（本地排队），只有几毫秒说明时间全花在等上游。
 3. **不设 WriteTimeout** —— 流式响应可持续数分钟，写超时会误杀长连接。
 4. **优雅退出** —— 收到 SIGTERM 后 `/readyz` 先转 503 让 LB 摘流量，再关闭连接。
 5. **别名库维护** —— 上游发布新版本号时及时登记，否则脱敏会残留。
-6. **通配规则慎用 catch-all** —— 配了 `*=某模型` 之后所有未知模型都会被静默接受，
+6. **`MAX_SANITIZE_BYTES` 触发即 400** —— span 的 `gateway.error.kind` 为
+   `response_too_large`。持续出现说明有客户端在请求超大响应（多见于没限制
+   `max_tokens`）：先让它改请求，确实需要再调高上限 —— 那会按并发数放大内存占用。
+7. **通配规则慎用 catch-all** —— 配了 `*=某模型` 之后所有未知模型都会被静默接受，
    排障时先看日志的 `match` 字段确认命中的是哪一级。
-7. **网络隔离** —— 网关无准入鉴权，公网部署时请用安全组 / 内网 / 反代限制来源，
+8. **网络隔离** —— 网关无准入鉴权，公网部署时请用安全组 / 内网 / 反代限制来源，
    并考虑关闭 `UPSTREAM_BASE_FROM_HEADER`。
-8. **本机联调** —— 若系统设了 `HTTP_PROXY`，访问本机网关的 curl 需加 `--noproxy '*'`，
+9. **本机联调** —— 若系统设了 `HTTP_PROXY`，访问本机网关的 curl 需加 `--noproxy '*'`，
    否则请求会被代理拦截，表现为莫名 502 且网关日志无记录。
 
 ---

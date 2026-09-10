@@ -120,6 +120,13 @@ type state struct {
 	// mx 是本次请求实际使用的指标集合。命中 EXCLUDED_URLS 时它是空集合，
 	// 所有上报退化为 no-op —— 排除判断只在 ServeHTTP 入口做一次。
 	mx *obs.Metrics
+	// requestID 是客户端传入的请求标识，用于把看板与客户端日志串起来。
+	// 空串表示客户端没提供：网关不自己生成，生成的 ID 客户端不认识，
+	// 串联不起任何东西。
+	requestID string
+	// credFP 是本次实际使用凭据的哈希前缀，用于按渠道聚合上游错误。
+	// 空串表示本次没有可用凭据。
+	credFP string
 }
 
 // nextAttempt 递增并返回失败尝试序号（首次为 1）。
@@ -140,9 +147,12 @@ func (st *state) nextAttempt() int {
 const modelOther = "other"
 
 // overloadRetryAfter 是过载时建议客户端退避的秒数。
-// 取值考虑 LLM 请求的典型时长：太短会让客户端立刻回来加剧拥塞，
-// 太长则在瞬时尖峰过去后浪费容量。
-const overloadRetryAfter = 2
+//
+// 取值必须参照 LLM 请求的典型时长，而不是 HTTP 接口的习惯：一次生成动辄
+// 数十秒，让客户端 2 秒后回来只会立刻再被拒一次，形成「拒绝—重试—拒绝」
+// 的抖动循环，把负载维持在高位。取一个与请求时长同量级的值，
+// 客户端回来时才有实际机会拿到名额。
+const overloadRetryAfter = 5
 
 // metricAttrs 构建本次请求的指标标签，model 维度已做基数收敛。
 func (st *state) metricAttrs(outcome string, status int) metric.MeasurementOption {
@@ -173,6 +183,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 与未声明的模型名共用同一条时间序列。
 	st := &state{route: route, start: start, metricModel: modelOther, mx: mx}
 
+	// 两项都要算哈希/扫描请求头，只在真正会记录时才做 ——
+	// obs 关闭时 span 不记录，算了也没人看。
+	if span.IsRecording() {
+		st.requestID = inboundRequestID(r)
+		st.credFP = credentialFingerprint(g.effectiveCredential(r))
+	}
+
 	// 闸门必须在读取请求体之前获取：body 一旦读入就占用了
 	// 最多 MAX_BODY_BYTES 的内存，此时再拒绝已经失去保护意义。
 	release, ok := g.gate.tryAcquire()
@@ -183,8 +200,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 网关自己拒的，不是上游返回的」，并带上当时的在途水位。
 		cur, limit := g.InFlight()
 		span.SetAttributes(
-			attribute.Int("gateway.inflight", cur),
-			attribute.Int("gateway.inflight_limit", limit),
+			attribute.Int(obs.AttrInflight, cur),
+			attribute.Int(obs.AttrInflightLimit, limit),
 		)
 		obs.RecordGatewayError(span, st.outcome,
 			"gateway at capacity; retry after "+strconv.Itoa(overloadRetryAfter)+"s", nil)
@@ -203,6 +220,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	obs.Add(ctx, mx.Requests, 1, a)
 	obs.Record(ctx, mx.Duration, msSince(start), a)
 	obs.Add(ctx, mx.BytesIn, st.bytesIn, a)
+
+	// 收尾统一补齐结果与水位类属性：这些字段此前只写在成功路径上，
+	// 失败请求的 span 里既没有最终状态码也没有体积。
+	g.setTailAttrs(span, st, status)
 
 	g.log(st, status, r)
 }
@@ -286,17 +307,19 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	var upstreamStatus int
 
 	sendAt := time.Now()
-	resp, cancel, err := g.client.Do(ctx, ureq, st.stream)
+	resp, cancel, timing, err := g.client.Do(ctx, ureq, st.stream)
+	recordUpstreamTiming(span, timing)
 
 	// 连接层失败：还没有任何字节写给客户端，可以安全地换模型重试。
 	if err != nil && plan.enabled {
 		// applyPlan 会覆盖 st.upstreamModel，from_model 必须在切换前取。
 		failedModel := st.upstreamModel
+		// 首次失败**无条件**留痕。此前只在重试成功时才记录首次失败，
+		// 于是「主模型先挂、备用也挂」的场景下真正出问题的主模型没有任何
+		// 独立记录 —— 看板上只剩备用模型的失败，排查方向被整个带偏。
+		obs.RecordAttemptFailure(span, "transport", failedModel, ureq.URL.Path, 0, st.nextAttempt(), err)
 		if r2, c2, ok := g.retryWithFallback(ctx, r, spec, base, outBody, plan, st, nil); ok {
-			// 切换成功，整个请求最终是成功的，因此不标红 span；但首次
-			// 失败的原因要留痕 —— 否则「兜底一直在生效」这件事本身
-			// 完全不可见，上游某个模型静默挂掉也无人发现。
-			obs.RecordAttemptFailure(span, "transport", failedModel, ureq.URL.Path, 0, st.nextAttempt(), err)
+			// 切换成功，整个请求最终是成功的，因此不标红 span。
 			resp, cancel, err = r2, c2, nil
 			st.applyPlan(plan)
 			// 事件之外再落一份 span 属性：事件属性在 trace 列表和筛选里
@@ -386,7 +409,7 @@ func (g *Gateway) handle(ctx context.Context, w http.ResponseWriter, r *http.Req
 	// 而非事件流，且它是排查的唯一线索。交给 pipeBuffered 读入并上报。
 	if isSSE(resp) && resp.StatusCode < 400 {
 		st.outcome = "stream"
-		return g.pipeStream(ctx, w, resp, spec, rep, st, span)
+		return g.pipeStream(ctx, w, resp, spec, rep, st, span, cancel)
 	}
 	st.outcome = outcomeForStatus(resp.StatusCode)
 	return g.pipeBuffered(ctx, w, resp, spec, rep, st, span)
@@ -544,10 +567,8 @@ func (g *Gateway) buildRequest(
 
 	// 凭据透传：取客户端的 Key（或配置的兜底），按目标协议的方式注入。
 	// 这样客户端无需关心上游是 Bearer 还是 x-api-key。
-	key := extractCredential(r.Header)
-	if key == "" {
-		key = g.cfg.Upstream.Key
-	}
+	// 取值统一走 effectiveCredential，保证与上报的凭据指纹同源。
+	key := g.effectiveCredential(r)
 	if v := spec.AuthValue(key); v != "" {
 		req.Header.Set(spec.AuthHeader, v)
 	}

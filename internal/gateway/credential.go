@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -64,6 +66,69 @@ func trimScheme(v, scheme string) (key string, ok bool) {
 		return "", false // 如 "BearerToken"，不是方案前缀
 	}
 	return strings.TrimSpace(rest), true
+}
+
+// credentialFingerprint 返回凭据的短指纹，用于按渠道聚合上游错误。
+//
+// 上游的限流与配额是按账号/渠道计的，不记指纹就无法回答「是不是某个 key
+// 被打爆了」—— 所有渠道的错误会混在同一条曲线里。
+//
+// 只取 sha256 的前 4 字节（8 位十六进制）：足以区分不同 key，又不构成
+// 可逆信息。刻意不用「前 4 位 + 后 4 位」这类可读前缀 —— 凭据是客户端
+// 透传进来的，落进第三方可观测后端就等于泄露，而前缀组合会在凭证库里
+// 大幅缩小检索范围。
+func credentialFingerprint(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:4])
+}
+
+// effectiveCredential 返回本次请求实际会使用的凭据：客户端优先，配置兜底。
+//
+// 集中在此而非在 buildRequest 里就地取值：指纹必须与实际发出去的凭据
+// 同源，两处各取一次迟早会因为分支不同而错位，而错位的表现是
+// 「指纹对不上但看不出哪里不对」。
+func (g *Gateway) effectiveCredential(r *http.Request) string {
+	if k := extractCredential(r.Header); k != "" {
+		return k
+	}
+	return g.cfg.Upstream.Key
+}
+
+// inboundRequestIDHeaders 是客户端可能用来标识一次调用的请求头，按常见程度排列。
+//
+// Header.Get 本身已做大小写折叠，因此这里不重复列 X-Request-ID 之类的变体。
+var inboundRequestIDHeaders = []string{
+	"X-Request-Id",
+	"Request-Id",
+	"X-Correlation-Id",
+	"X-Trace-Id",
+}
+
+// inboundRequestIDLen 是允许上报的请求标识长度上限。
+// 头部由客户端可写，不设上限等于允许把任意长文本塞进 span。
+const inboundRequestIDLen = 128
+
+// inboundRequestID 取客户端传入的请求标识，缺省返回空串。
+//
+// 刻意不自己生成：网关生成的 ID 客户端并不知道，串联不起任何东西 ——
+// 这个字段的全部价值在于「同一个 ID 同时出现在客户端日志和看板里」。
+// 上游超时时尤其重要：一个字节都没回来，也就拿不到对方的 logid，
+// 客户端自己的 ID 是唯一剩下的对账凭据。
+func inboundRequestID(r *http.Request) string {
+	for _, k := range inboundRequestIDHeaders {
+		v := strings.TrimSpace(r.Header.Get(k))
+		if v == "" {
+			continue
+		}
+		if len(v) > inboundRequestIDLen {
+			v = v[:inboundRequestIDLen]
+		}
+		return v
+	}
+	return ""
 }
 
 // isCredentialHeader 报告某个头名是否承载凭据（转发时需剔除后重新注入）。

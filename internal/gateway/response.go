@@ -15,6 +15,7 @@ import (
 	"github.com/betterme/remap-service/internal/obs"
 	"github.com/betterme/remap-service/internal/protocol"
 	"github.com/betterme/remap-service/internal/sanitize"
+	"github.com/betterme/remap-service/internal/upstream"
 )
 
 // transformer 把「协议规格 + 替换器」适配为 SSE 行处理器。
@@ -33,9 +34,13 @@ func (t transformer) Data(payload []byte) ([]byte, bool) {
 }
 
 // pipeStream 转发 SSE 流式响应，逐 chunk 脱敏并即时 flush。
+//
+// cancel 是本次上游请求的取消函数，交给空闲超时看门狗使用 ——
+// 只有取消请求 context 才能真正让传输层放弃这条连接。
 func (g *Gateway) pipeStream(
 	ctx context.Context, w http.ResponseWriter, resp *http.Response,
 	spec *protocol.Spec, rep *sanitize.Replacer, st *state, span trace.Span,
+	cancel context.CancelFunc,
 ) int {
 	h := w.Header()
 	h.Set("Cache-Control", "no-cache, no-transform")
@@ -53,7 +58,21 @@ func (g *Gateway) pipeStream(
 		tr = transformer{spec: spec, rep: rep, public: st.publicModel}
 	}
 
-	stats, err := protocol.PipeSSE(w, resp.Body, tr, fl)
+	// 空闲超时：响应头已到、流已建立，但上游中途不再吐数据。
+	//
+	// 这是首字节与总超时都覆盖不到的形态：看门狗此刻已解除，而总超时
+	// 要等到 StreamTimeout（默认 30 分钟）才生效，中间这段时间请求一直
+	// 占着并发名额、连接和内存，客户端却什么都收不到。
+	var src io.Reader = resp.Body
+	stall := upstream.NewStallReader(resp.Body, g.cfg.Upstream.StallTimeout, cancel)
+	if stall != nil {
+		src = stall
+		// 负责停掉计时器。底层响应体的关闭仍由 handle 的 defer 负责，
+		// 重复 Close 是幂等的。
+		defer stall.Close()
+	}
+
+	stats, err := protocol.PipeSSE(w, src, tr, fl)
 	st.sseEvents = stats.Events
 	st.bytesOut = stats.Bytes
 	st.rewrites = stats.Rewrote
@@ -70,6 +89,18 @@ func (g *Gateway) pipeStream(
 	if err != nil {
 		st.err = err
 		switch {
+		// 空闲超时优先判定，顺序不能与下面互换：它通过 cancel 断开，
+		// 读操作返回的是 context.Canceled，而 isClientGone 恰好看作
+		// 「客户端提前断开」—— 那不是故障、不标红、不计错误率。
+		// 判定顺序反了，最该告警的形态会被静默吞掉。
+		case stall.Tripped():
+			st.outcome = "stream_stall"
+			// 用带阈值的超时错误替换裸的 context.Canceled：
+			// 后者落到看板上只有一句 "context deadline exceeded"。
+			st.err = stall.Err(resp.Request.URL)
+			obs.RecordError(span, st.outcome, st.err)
+			obs.Add(ctx, st.mx.UpstreamErr, 1, a)
+
 		// 客户端提前断开不是故障：span 保持 Unset，也不计上游错误，
 		// 否则长耗时流式请求会因用户主动取消而在看板上大面积泛红。
 		case isClientGone(err):
@@ -97,7 +128,21 @@ func (g *Gateway) pipeStream(
 }
 
 // pipeBuffered 处理非流式响应：整体读入后做字段级脱敏。
-// 超过 MAX_SANITIZE_BYTES 的响应直接透传，避免大响应打爆内存。
+//
+// # 超过 MAX_SANITIZE_BYTES 为什么直接失败，而不是原文直通
+//
+// 原文直通会在客户端毫不知情的情况下把上游真实标识原样送出去 ——
+// 正常响应里的 model / id / system_fingerprint，错误正文里的真实模型名，
+// 全都是脱敏存在的理由。**一次明确的失败是可观测、可重现的；一次静默的
+// 泄漏不是。** 宁可让客户端拿到一个 400，也不要让它拿到一份未经处理的响应。
+//
+// 状态码取 400 而非 5xx：上游正常返回了，是网关基于策略拒绝转发。记成 5xx
+// 会把责任错误地推给上游，让上游侧的错误率被这类请求污染。
+//
+// 判据是 needSanitize，而不是「脱敏开关是否打开」：脱敏关闭、或本次请求
+// 没有 model 字段时本来就不会执行任何替换，这时上限只剩「防止大响应打爆
+// 内存」一个作用，透传是对的。对这类响应报 400 会让 SANITIZE_OFF 的部署
+// 整类失败，而它并不存在泄漏面。
 func (g *Gateway) pipeBuffered(
 	ctx context.Context, w http.ResponseWriter, resp *http.Response,
 	spec *protocol.Spec, rep *sanitize.Replacer, st *state, span trace.Span,
@@ -105,12 +150,21 @@ func (g *Gateway) pipeBuffered(
 	limit := g.cfg.Limits.MaxSanitizeBytes
 	needSanitize := g.cfg.SanitizeEnabled() && st.publicModel != ""
 
-	// 无需脱敏或响应过大：零拷贝直通。
+	// 需要脱敏，且 Content-Length 已经表明超限：在读任何字节之前就拒绝。
+	// 这条路径读进来只为丢掉，白占内存也白占带宽。
+	//
+	// ContentLength < 0 表示长度未知（chunked），不能据此判定，留给下面
+	// 读完之后的检查。
+	if needSanitize && resp.ContentLength > limit {
+		return g.rejectOversizeResponse(w, resp, st, span, nil)
+	}
+
+	// 无需脱敏：零拷贝直通。
 	//
 	// 例外：4xx/5xx 不走这条路。错误正文是排查的唯一线索，必须先读进内存
 	// 才能上报；且错误响应一定很小（各家上游的错误 JSON 都在几百字节内），
 	// 缓冲它不构成内存风险 —— 真正需要防的是正常响应的大 body。
-	if resp.StatusCode < 400 && (!needSanitize || (resp.ContentLength > 0 && resp.ContentLength > limit)) {
+	if resp.StatusCode < 400 && !needSanitize {
 		if resp.ContentLength >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 		}
@@ -140,15 +194,18 @@ func (g *Gateway) pipeBuffered(
 		return writeError(w, http.StatusBadGateway, "upstream_error", "failed to read upstream response")
 	}
 	if int64(len(body)) > limit {
-		// 超限：已读部分 + 剩余流原样透传，放弃脱敏。
+		// 走到这里说明长度未知或不可信（chunked，或上游声明的长度与实际
+		// 不符），只能读完才发现超限 —— 上限本身保证了最多多读一个字节。
+		if needSanitize {
+			return g.rejectOversizeResponse(w, resp, st, span, body)
+		}
+		// 不需要脱敏时超限只是内存问题：已读部分 + 剩余流原样透传。
 		w.WriteHeader(resp.StatusCode)
 		n1, _ := w.Write(body)
 		n2, _ := io.Copy(w, resp.Body)
 		st.bytesOut = int64(n1) + n2
 		st.outcome = "sanitize_skipped_too_large"
 		if resp.StatusCode >= 400 {
-			// 错误正文超过 MAX_SANITIZE_BYTES 属异常形态（通常是上游把
-			// 整个请求回显了）。只上报已读到的前缀。
 			g.recordUpstreamStatus(resp, body, st, span)
 		}
 		return resp.StatusCode
@@ -187,6 +244,53 @@ func (g *Gateway) pipeBuffered(
 		g.recordUpstreamStatus(resp, body, st, span)
 	}
 	return resp.StatusCode
+}
+
+// rejectOversizeResponse 拒绝一个「需要脱敏但超出上限」的响应。
+//
+// prefix 是已经读进内存的正文前缀（走 Content-Length 提前判定的路径时为 nil），
+// 只用于上报、绝不回给客户端 —— 上游为什么返回这么大一段，是排查这类拒绝时
+// 唯一的线索。**仅在上游本身是错误响应时才上报**：正常响应的那一段是模型
+// 生成的内容，既没有诊断价值，也不该被搬到看板上。
+func (g *Gateway) rejectOversizeResponse(
+	w http.ResponseWriter, resp *http.Response, st *state, span trace.Span, prefix []byte,
+) int {
+	st.outcome = "response_too_large"
+
+	// 此刻 w 上还挂着 copyResponseHeaders 复制过来的上游响应头。必须清掉：
+	// 它们属于「上游正常响应」这个上下文，挂在一个网关自己产生的 400 上
+	// 既不成立，也可能把上游标识（Server、各家 logid）带出去。
+	// writeError 只补 Content-Type，不负责清理。
+	h := w.Header()
+	for k := range h {
+		h.Del(k)
+	}
+
+	// 上游真实状态码与错误正文仍要留痕，否则「上游本来返回了什么」永久丢失。
+	//
+	// Content-Length 提前判定的路径上还没读过正文，这里按上报上限补读一个
+	// 前缀：上游报错时「为什么返回这么大一段」正是排查的关键，而错误响应
+	// 本就该是几百字节，超大属异常形态。正常响应不读 —— 那是一段模型生成的
+	// 内容，既无诊断价值，也不该被搬到看板上。
+	if resp.StatusCode >= 400 {
+		if prefix == nil {
+			if n := g.o.ErrorBodyLimit(); n > 0 {
+				prefix, _ = io.ReadAll(io.LimitReader(resp.Body, int64(n)))
+			}
+		}
+		if len(prefix) > 0 {
+			// 顺序不能反：RecordUpstreamError 会把 gateway.error.kind 写成
+			// upstream_status，盖掉本函数的 response_too_large —— 看板上就
+			// 分不出「上游失败」与「网关因过大而拒发」这两种不同的成因。
+			g.recordUpstreamStatus(resp, prefix, st, span)
+		}
+	}
+
+	msg := "upstream response too large to sanitize (limit " +
+		strconv.FormatInt(g.cfg.Limits.MaxSanitizeBytes, 10) +
+		" bytes); reduce the response size or raise MAX_SANITIZE_BYTES"
+	obs.RecordGatewayError(span, st.outcome, msg, nil)
+	return writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 }
 
 // recordUpstreamStatus 把上游的错误响应（状态码 + 正文 + 关键头）落到 span。

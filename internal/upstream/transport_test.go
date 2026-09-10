@@ -17,7 +17,13 @@ import (
 
 func newClient(firstByte, total time.Duration) (*Client, func()) {
 	tr := NewTransport(0)
-	c := NewClient(tr, config.Upstream{FirstByteTimeout: firstByte, Timeout: total})
+	// 两个首字节上限都显式给出：非流式那个的语义是「整段生成上限」，
+	// 与流式的 TTFT 不是一回事，测试里必须明确它测的是哪一个。
+	c := NewClient(tr, config.Upstream{
+		FirstByteTimeout:          firstByte,
+		FirstByteTimeoutNonStream: firstByte,
+		Timeout:                   total,
+	})
 	return c, tr.CloseIdleConnections
 }
 
@@ -35,7 +41,7 @@ func TestFirstByteTimeout(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
 	start := time.Now()
-	_, cancel, err := c.Do(context.Background(), req, false)
+	_, cancel, _, err := c.Do(context.Background(), req, false)
 	cancel()
 
 	if err == nil {
@@ -65,7 +71,7 @@ func TestStreamNotKilledAfterHeaders(t *testing.T) {
 	defer closeTr()
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
-	resp, cancel, err := c.Do(context.Background(), req, true)
+	resp, cancel, _, err := c.Do(context.Background(), req, true)
 	if err != nil {
 		t.Fatalf("响应头已及时返回，不应报错: %v", err)
 	}
@@ -94,7 +100,7 @@ func TestTotalTimeoutNonStream(t *testing.T) {
 	defer closeTr()
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
-	resp, cancel, err := c.Do(context.Background(), req, false)
+	resp, cancel, _, err := c.Do(context.Background(), req, false)
 	if err != nil {
 		t.Fatalf("响应头正常，Do 不应报错: %v", err)
 	}
@@ -123,7 +129,7 @@ func TestCallerContextCancel(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
 	start := time.Now()
-	_, cancel, err := c.Do(ctx, req, false)
+	_, cancel, _, err := c.Do(ctx, req, false)
 	cancel()
 
 	if err == nil {
@@ -150,15 +156,20 @@ func TestConnectionReuse(t *testing.T) {
 	c, closeTr := newClient(5*time.Second, 5*time.Second)
 	defer closeTr()
 
+	var firstTiming, lastTiming Timing
 	for i := 0; i < 100; i++ {
 		req, _ := http.NewRequest(http.MethodGet, us.URL, nil)
-		resp, cancel, err := c.Do(context.Background(), req, false)
+		resp, cancel, timing, err := c.Do(context.Background(), req, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body) // 必须读完，否则连接无法复用
 		resp.Body.Close()
 		cancel()
+		if i == 0 {
+			firstTiming = timing
+		}
+		lastTiming = timing
 	}
 
 	n := 0
@@ -168,6 +179,31 @@ func TestConnectionReuse(t *testing.T) {
 	}
 	if count.Load() != 100 {
 		t.Errorf("上游收到 %d 个请求", count.Load())
+	}
+
+	// 埋点必须与真实连接行为一致。httptrace 的钩子挂错位置（写成别的请求、
+	// 或回调根本没触发）时连接复用本身仍然正常，只有这组断言会失败 ——
+	// 而 wrote_request 正是判定超时归属的唯一依据，不能靠"看着像对的"。
+	if !firstTiming.GotConn {
+		t.Error("首次请求应记录 GotConn")
+	}
+	if firstTiming.Reused {
+		t.Error("首次请求不应标记为复用连接")
+	}
+	if firstTiming.WroteRequest <= 0 {
+		t.Errorf("缺少 wrote_request 时刻，超时归属将无法判定: %+v", firstTiming)
+	}
+	if firstTiming.FirstByte <= 0 {
+		t.Errorf("缺少 first_byte 时刻: %+v", firstTiming)
+	}
+	if firstTiming.Proto != "http/1.1" {
+		t.Errorf("proto = %q，httptest 是明文 HTTP，应归一为 http/1.1", firstTiming.Proto)
+	}
+	if !lastTiming.Reused {
+		t.Error("第 100 次请求必须复用连接")
+	}
+	if lastTiming.DNS != 0 || lastTiming.Connect != 0 {
+		t.Errorf("复用连接时不应再有 DNS/建连耗时: %+v", lastTiming)
 	}
 }
 

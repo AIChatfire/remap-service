@@ -246,13 +246,13 @@ func hasAttr(s sdktrace.ReadOnlySpan, key string) bool {
 	return false
 }
 
-// 超过 MAX_SANITIZE_BYTES 的大正文同样按原文上报。
+// 超过 MAX_SANITIZE_BYTES 且本次需要脱敏 → **直接 400，绝不原文直通**。
 //
-// 原先这里断言 body_sanitized=false（区分「脱敏过」与「超限直通」）。现在
-// 上报给看板的正文恒为上游原文，该标记恒 false、已随之移除 —— 恒定值不构成
-// 筛选维度。保留本用例是为了守住「大正文不会被截断成另一种形态」。
-func TestUnsanitizedErrorBodyIsFlagged(t *testing.T) {
-	// 正文里带上游真实模型名，正是脱敏本该抹掉、这条路径抹不掉的东西。
+// 这条守的是「静默泄漏」这个失效形态：旧实现放弃脱敏、把上游原文原样转发，
+// 响应里带着真实上游模型名而客户端毫不知情。现在宁可给一个明确的失败 ——
+// 一次可观测、可重现的失败，好过一次不可观测的泄漏。
+func TestOversizeResponseIsRejectedNotLeaked(t *testing.T) {
+	// 正文里带上游真实模型名，正是脱敏本该抹掉的那种东西。
 	upstreamBody := `{"error":{"message":"model deepseek-v3-0324 not found","padding":"` +
 		strings.Repeat("x", 256) + `"}}`
 
@@ -262,23 +262,116 @@ func TestUnsanitizedErrorBodyIsFlagged(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(upstreamBody))
 	}, func(c *config.Config) {
-		// 压到远小于正文，强制走超限直通。
+		// 压到远小于正文，强制超限。
 		c.Limits.MaxSanitizeBytes = 64
 	})
 
 	resp := post(t, gs, "/v1/chat/completions", chatBody, nil)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("状态码应透传，实际 %d", resp.StatusCode)
+	// 400 而不是 404：上游是正常返回的，是网关基于策略拒发。记成 5xx 会把
+	// 责任推给上游，污染上游侧的错误率。
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("超限且需要脱敏时应返回 400，实际 %d", resp.StatusCode)
 	}
 
-	span := findSpanWithAttr(t, sr, "gateway.error.body")
-	if got := attrString(span, "gateway.error.body"); !strings.Contains(got, "deepseek-v3-0324") {
-		t.Errorf("超限直通应上报原文，实际 %q", got)
+	clientBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取客户端正文失败: %v", err)
 	}
-	// 标记已移除：正文恒为原文后它恒 false，留着会让人误以为存在两种形态。
-	if attrString(span, "gateway.error.body_sanitized") != "" {
-		t.Error("body_sanitized 应已移除")
+	// 核心断言：上游正文一个字节都不能漏出去。
+	if strings.Contains(string(clientBody), "deepseek-v3-0324") {
+		t.Errorf("客户端拿到了未脱敏的上游正文，泄漏: %q", clientBody)
+	}
+	if strings.Contains(string(clientBody), "padding") {
+		t.Errorf("客户端拿到了上游正文片段: %q", clientBody)
+	}
+
+	span := findSpanWithAttr(t, sr, obs.AttrErrKind)
+	if got := attrString(span, obs.AttrErrKind); got != "response_too_large" {
+		t.Errorf("error.kind 应为 response_too_large，实际 %q", got)
+	}
+	// 上游真实状态码必须留下：换成 400 后若不记，看板上「上游本来返回了什么」
+	// 就永久丢失，无从判断这是上游故障还是网关策略。
+	if got := attrInt(span, obs.AttrUpstreamStatus); got != http.StatusNotFound {
+		t.Errorf("gateway.upstream.status_code 应为上游的 404，实际 %d", got)
+	}
+	// 上游错误正文的原始片段仍要上报 —— 只进看板，绝不进客户端。
+	if got := attrString(span, obs.AttrErrBody); !strings.Contains(got, "deepseek-v3-0324") {
+		t.Errorf("看板应拿到上游错误正文原文，实际 %q", got)
+	}
+}
+
+// 不需要脱敏时上限只是内存护栏，仍然透传。
+//
+// 不能把这类响应也打成 400：脱敏关闭（或本次请求没有 model 字段）时本来
+// 就不执行任何替换，根本不存在泄漏面，报 400 只会让 SANITIZE_OFF 的部署
+// 在遇到大响应时整类失败。
+func TestOversizeResponseStillPassesWhenSanitizeNotNeeded(t *testing.T) {
+	upstreamBody := `{"error":{"message":"boom"},"padding":"` +
+		strings.Repeat("x", 256) + `"}}`
+
+	sr := tracetest.NewSpanRecorder()
+	gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(upstreamBody))
+	}, func(c *config.Config) {
+		c.Sanitize.Off = true
+		c.Limits.MaxSanitizeBytes = 64
+	})
+
+	resp := post(t, gs, "/v1/chat/completions", chatBody, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("不需要脱敏时应透传上游状态，实际 %d", resp.StatusCode)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取客户端正文失败: %v", err)
+	}
+	if string(got) != upstreamBody {
+		t.Errorf("不需要脱敏时应原样透传，实际 %q", got)
+	}
+}
+
+// Content-Length 未知（chunked）时只能在读满才发现超限，行为必须与提前判定一致。
+//
+// 两条判定路径是分开实现的（提前看 Content-Length / 读完发现超限），
+// 只测其中一条时另一条写错照样全绿。
+func TestOversizeResponseRejectedOnChunkedBody(t *testing.T) {
+	const upstreamBody = `{"model":"deepseek-v3-0324","choices":[]}`
+
+	sr := tracetest.NewSpanRecorder()
+	gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// 先 flush 一次，迫使响应走 chunked、Content-Length 为 -1。
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte(upstreamBody))
+	}, func(c *config.Config) {
+		c.Limits.MaxSanitizeBytes = 8
+	})
+
+	resp := post(t, gs, "/v1/chat/completions", `{"model":"pub"}`, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("chunked 超限同样应返回 400，实际 %d", resp.StatusCode)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取客户端正文失败: %v", err)
+	}
+	if strings.Contains(string(got), "deepseek-v3-0324") {
+		t.Errorf("客户端拿到了未脱敏正文，泄漏: %q", got)
+	}
+
+	span := findSpanWithAttr(t, sr, obs.AttrErrKind)
+	if got := attrString(span, obs.AttrErrKind); got != "response_too_large" {
+		t.Errorf("error.kind 应为 response_too_large，实际 %q", got)
+	}
+	// 上游是 200，这条路径不读正文上报：那是一段模型生成内容。
+	if hasAttr(span, obs.AttrErrBody) {
+		t.Error("正常响应的正文不应被搬到看板上")
 	}
 }
 

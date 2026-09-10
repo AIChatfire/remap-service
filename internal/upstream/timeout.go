@@ -7,14 +7,19 @@ import (
 	"time"
 )
 
-// 超时的两种成因。它们的处置方向完全不同，混在一起会把排查带偏：
-// 首字节超时指向上游排队或模型冷启动（该调大 UPSTREAM_FIRST_BYTE_TIMEOUT），
-// 总超时指向单次生成确实太长（该调大 UPSTREAM_TIMEOUT 或改用流式）。
+// 超时的三种成因。它们的处置方向完全不同，混在一起会把排查带偏：
+//   - 首字节超时指向上游排队或模型冷启动（该调 UPSTREAM_FIRST_BYTE_*）；
+//   - 总超时指向单次生成确实太长（该调 UPSTREAM_TIMEOUT / STREAM_TIMEOUT）；
+//   - 空闲超时指向流建立后上游中途停摆（该调 UPSTREAM_STALL_TIMEOUT）。
 const (
 	// TimeoutKindFirstByte：响应头在 first_byte_timeout 内没到。
 	TimeoutKindFirstByte = "first_byte"
 	// TimeoutKindTotal：响应头已到，整体时长超过总超时上限。
 	TimeoutKindTotal = "total"
+	// TimeoutKindStall：响应头已到、流已建立，但两个数据块之间超过
+	// UPSTREAM_STALL_TIMEOUT。它与 total 的区别是「不是太长，是停住了」——
+	// 总超时可能在 30 分钟后才生效，而这条流从第 10 秒起就已经死了。
+	TimeoutKindStall = "stall"
 )
 
 // TimeoutError 是带上下文的超时错误。
@@ -38,8 +43,9 @@ type TimeoutError struct {
 	// URL 是上游端点，已剥掉 query 与 userinfo。凭据只走 header，
 	// 但仍按最小暴露原则处理，避免日后有人把 token 塞进 query 时静默泄漏。
 	URL string
-	// Stream 标记是否流式请求。流式的总超时上限被刻意放宽到 30 分钟，
-	// 不带这个标记会让人对着 120s 的配置值困惑。
+	// Stream 标记是否流式请求。流式的总超时上限来自 UPSTREAM_STREAM_TIMEOUT，
+	// 与非流式的 UPSTREAM_TIMEOUT 是两套独立的值；不带这个标记会让人
+	// 对着非流式的配置困惑「为什么不是这个上限」。
 	Stream bool
 }
 
