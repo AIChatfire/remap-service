@@ -1,7 +1,10 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/betterme/remap-service/internal/config"
 	"github.com/betterme/remap-service/internal/obs"
+	"github.com/betterme/remap-service/internal/upstream"
 )
 
 // 流建立后上游停摆：必须由空闲超时断开，且**不能被当成客户端离开**。
@@ -152,6 +156,86 @@ func TestRequestIDCredentialAndTimingAttrs(t *testing.T) {
 	}
 	if !hasAttr(sp, obs.AttrUpstreamConnReused) {
 		t.Error("缺少连接复用标记")
+	}
+}
+
+// TRUSTED_PROXY_HOPS 必须真的作用到 client.address 上，而不只是「配了」。
+//
+// 守的是「配置不生效」这一类缺陷：ServeHTTP 里读错字段、或把 hops 硬编码成 0，
+// 都不会报错、测试也全绿 —— 表现是来源 IP 恒为代理地址（或反过来被 XFF 伪造），
+// 而两者都是「看起来正常的 IP」，不比对根本发现不了。
+//
+// clientIP 本身的位次语义由 clientip_test.go 覆盖，这里只验证**接线**。
+func TestTrustedProxyHopsReachesClientAddress(t *testing.T) {
+	// 左端是客户端可伪造的，右端由 Nginx 用 $proxy_add_x_forwarded_for 追加。
+	const spoofed = "1.2.3.4, 203.0.113.7"
+
+	cases := []struct {
+		name string
+		hops int
+		want string
+	}{
+		// httptest 直连网关，RemoteAddr 是本机回环。
+		{"hops=0 忽略 XFF，只信 RemoteAddr", 0, "127.0.0.1"},
+		{"hops=1 取 XFF 最右（Nginx 追加的真实客户端 IP）", 1, "203.0.113.7"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			hops := c.hops
+			sr := tracetest.NewSpanRecorder()
+			gs, _ := newFixtureWithRecorder(t, sr, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"model":"pub","choices":[]}`))
+			}, func(cfg *config.Config) {
+				cfg.Obs.TrustedProxyHops = hops
+			})
+
+			resp := post(t, gs, "/v1/chat/completions", `{"model":"pub"}`, map[string]string{
+				"X-Forwarded-For": spoofed,
+			})
+			defer resp.Body.Close()
+
+			sp := findSpanWithAttr(t, sr, "client.address")
+			if got := attrString(sp, "client.address"); got != c.want {
+				t.Errorf("client.address = %q, want %q —— 配置未生效或取错了 XFF 位次", got, c.want)
+			}
+		})
+	}
+}
+
+// client_ip 必须出现在结构化日志里。
+//
+// 它是核对 TRUSTED_PROXY_HOPS 的唯一离线手段 —— span 要走遥测链路才看得到，
+// 刚部署完 / 遥测没通时只能靠日志。这行被删掉不会有任何报错，只是某天再想
+// 核对时发现没有依据，所以用例把它锁住。
+func TestClientIPAppearsInStructuredLog(t *testing.T) {
+	var buf bytes.Buffer
+	o, err := obs.New(context.Background(), config.Obs{
+		LogLevel: "info", LogFormat: "json", LogUpstreamModel: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 输出改到 buffer：请求完成那条是 info 级，而 testObs 用的是 error 级，
+	// 整条会被丢掉。与替换 Provider.Tracer 是同一套做法 —— 只换公开字段。
+	o.Logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// 上游指向必然拒连的地址：本用例只关心走到 g.log，不关心上游返回什么。
+	cfg := testConfig("http://127.0.0.1:1")
+	cfg.Obs.TrustedProxyHops = 1
+	tr := upstream.NewTransport(cfg.Limits.MaxConns)
+	t.Cleanup(tr.CloseIdleConnections)
+	gw := New(cfg, upstream.NewClient(tr, cfg.Upstream), o)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"pub"}`))
+	req.Header.Set("Content-Type", "application/json")
+	// 左端可伪造、右端是反代追加的真实客户端 IP。
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.7")
+	gw.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !strings.Contains(buf.String(), `"client_ip":"203.0.113.7"`) {
+		t.Errorf("日志缺少正确的 client_ip，核对 hops 就没有依据了。实得:\n%s", buf.String())
 	}
 }
 

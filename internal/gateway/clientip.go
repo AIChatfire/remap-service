@@ -12,11 +12,16 @@ import (
 //
 //	hops = 0  只信任 RemoteAddr，完全忽略 X-Forwarded-For。
 //	          直接暴露在公网时必须用这个值。
-//	hops = n  从 X-Forwarded-For 右端向左跳过 n 个由可信代理追加的地址，
-//	          取再左一个作为客户端 IP。
+//	hops = n  取 X-Forwarded-For 右起第 n 位（RemoteAddr 本身算最右一跳）。
+//	          前置 1 层 Nginx / CLB 取最右一位；2 层取右起第二位。
 //
 // 之所以从右往左数：XFF 由每一跳追加，右端是离网关最近、最可信的部分，
 // 左端可被客户端预先伪造。盲取最左值等于让客户端自由声明自己的 IP。
+//
+// 注意这里是「右起第 n 位」而**不是**「跳过 n 个再取它左边那个」——前置 1 层
+// 代理时，真实客户端 IP 就是最右那一位（代理刚追加的）。两种写法只差一位，
+// 而差一位的后果是取到一个「看起来正常」的地址：不报错、不影响功能，
+// 只是静静地把每次请求的来源记成另一个人。改这里务必对照 clientip_test.go。
 func clientIP(r *http.Request, hops int) string {
 	if hops <= 0 {
 		return hostOnly(r.RemoteAddr)

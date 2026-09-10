@@ -127,6 +127,12 @@ type state struct {
 	// credFP 是本次实际使用凭据的哈希前缀，用于按渠道聚合上游错误。
 	// 空串表示本次没有可用凭据。
 	credFP string
+	// client 是按 TRUSTED_PROXY_HOPS 解析出的客户 IP。
+	//
+	// 同时进 span 属性与结构化日志，只解析一次 —— 两处各算一次的话，
+	// 一旦哪天改了位次逻辑，就可能出现「日志显示一个 IP、看板显示另一个」，
+	// 而两边看着都正常，只能靠人工比对才发现。
+	client string
 }
 
 // nextAttempt 递增并返回失败尝试序号（首次为 1）。
@@ -168,20 +174,23 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 集合，后续所有上报点无需再判断。请求本身照常代理。
 	mx := g.o.MetricsFor(r.URL.Path)
 
+	// 客户 IP 解析放在建 span 之前：span 属性的构造是内联参数，
+	// 没法在里面复用局部变量。它只作标签维度，**不进 metric label** ——
+	// IP 基数无上界，进 label 会按客户数量线性放大时间序列。
+	client := clientIP(r, g.cfg.Obs.TrustedProxyHops)
+
 	ctx, span := g.o.TracerFor(r.URL.Path).Start(r.Context(), "gateway "+route,
 		trace.WithSpanKind(trace.SpanKindServer),
 		trace.WithAttributes(
 			attribute.String("http.request.method", r.Method),
 			attribute.String("url.path", r.URL.Path),
-			// 客户 IP 只作 span 属性，不作指标标签：IP 基数无上界，
-			// 一旦进 metric label 就会按客户数量线性放大时间序列。
-			attribute.String("client.address", clientIP(r, g.cfg.Obs.TrustedProxyHops)),
+			attribute.String("client.address", client),
 		))
 	defer span.End()
 
 	// metricModel 默认取归一值：无 model 字段的端点（/v1/models 等）
 	// 与未声明的模型名共用同一条时间序列。
-	st := &state{route: route, start: start, metricModel: modelOther, mx: mx}
+	st := &state{route: route, start: start, metricModel: modelOther, mx: mx, client: client}
 
 	// 两项都要算哈希/扫描请求头，只在真正会记录时才做 ——
 	// obs 关闭时 span 不记录，算了也没人看。
@@ -630,6 +639,13 @@ func (g *Gateway) log(st *state, status int, r *http.Request) {
 	attrs := []any{
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
+		// 与 span 的 client.address 同源（同一个值，只解析一次）。
+		// 日志用短键名贴合本行的既有风格，grep 时注意别找 client.address。
+		//
+		// 进日志的理由：核对 TRUSTED_PROXY_HOPS 时不必等遥测链路 ——
+		// 发一个带哨兵 X-Forwarded-For 的请求，直接看这行是真实 IP、
+		// 代理 IP（hops 偏小）还是哨兵值（hops 偏大，可被伪造）。
+		slog.String("client_ip", st.client),
 		slog.String("proto", st.proto),
 		slog.Int("status", status),
 		slog.String("model", st.publicModel),
