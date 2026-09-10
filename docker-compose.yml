@@ -23,7 +23,7 @@ services:
       args:
         VERSION: ${VERSION:-dev}
         COMMIT: ${COMMIT:-none}
-    image: remap-gateway:${VERSION:-dev}
+    image: ghcr.io/aichatfire/remap-service:latest
     restart: unless-stopped
     ports:
       # 默认只绑本机。公网暴露前请确认已有反代或安全组兜底 ——
@@ -46,13 +46,6 @@ services:
     read_only: true          # 镜像里只有一个静态二进制，运行期无需写盘
     cap_drop:
       - ALL
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 512M
-        reservations:
-          memory: 128M
     networks:
       - remap
 
