@@ -231,3 +231,102 @@ func TestTransportDerivedFromMaxConns(t *testing.T) {
 		t.Error("应尝试 HTTP/2")
 	}
 }
+
+// 其余传输层参数：配了就按配置，没配就回落内置默认（与暴露前的行为一致）。
+func TestTransportParamsFromConfigAndDefaults(t *testing.T) {
+	tr := newTransport(64, config.Transport{
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 9 * time.Second,
+		MaxConnsPerHost:     512,
+		WriteBufferSize:     16 << 10,
+		ReadBufferSize:      8 << 10,
+	}, nil, nil)
+	if tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout = %v, want 30s", tr.IdleConnTimeout)
+	}
+	if tr.TLSHandshakeTimeout != 9*time.Second {
+		t.Errorf("TLSHandshakeTimeout = %v, want 9s", tr.TLSHandshakeTimeout)
+	}
+	if tr.MaxConnsPerHost != 512 {
+		t.Errorf("MaxConnsPerHost = %d, want 512", tr.MaxConnsPerHost)
+	}
+	if tr.WriteBufferSize != 16<<10 || tr.ReadBufferSize != 8<<10 {
+		t.Errorf("缓冲 = %d/%d, want 16/8 KiB", tr.WriteBufferSize, tr.ReadBufferSize)
+	}
+
+	// 零值必须完全等价于「参数暴露之前」的行为，否则手工构造的
+	// config.Transport 会静默改变生产行为。
+	def := newTransport(64, config.Transport{}, nil, nil)
+	if def.IdleConnTimeout != defIdleConnTimeout {
+		t.Errorf("IdleConnTimeout 零值应回落 %v，实际 %v", defIdleConnTimeout, def.IdleConnTimeout)
+	}
+	if def.TLSHandshakeTimeout != defTLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout 零值应回落 %v，实际 %v",
+			defTLSHandshakeTimeout, def.TLSHandshakeTimeout)
+	}
+	if def.WriteBufferSize != defBufSize || def.ReadBufferSize != defBufSize {
+		t.Errorf("零值缓冲应回落 %d，实际 %d/%d", defBufSize, def.WriteBufferSize, def.ReadBufferSize)
+	}
+	// MaxConnsPerHost 的 0 是「不限制」的有效取值，不能被默认值顶掉 ——
+	// 这条专门守 orInt 被误用（它会把 0 换成默认值）。
+	if def.MaxConnsPerHost != 0 {
+		t.Errorf("MaxConnsPerHost 零值必须保持「不限制」，实际 %d", def.MaxConnsPerHost)
+	}
+}
+
+// 拨号超时与保活间隔读不回来，只能断言构造阶段。
+//
+// DialTimeout 尤其要守住：它与调用方预算可能同量级，配错时的表现是
+// i/o timeout 而非带上下文的超时错误，是最容易被误读的一个参数。
+func TestDialerTimeoutsFromConfigAndDefaults(t *testing.T) {
+	d := newDialer(config.Transport{DialTimeout: 12 * time.Second, KeepAlive: 45 * time.Second})
+	if d.Timeout != 12*time.Second {
+		t.Errorf("Dialer.Timeout = %v, want 12s", d.Timeout)
+	}
+	if d.KeepAlive != 45*time.Second {
+		t.Errorf("Dialer.KeepAlive = %v, want 45s", d.KeepAlive)
+	}
+
+	def := newDialer(config.Transport{})
+	if def.Timeout != defDialTimeout {
+		t.Errorf("Dialer.Timeout 零值应回落 %v，实际 %v", defDialTimeout, def.Timeout)
+	}
+	if def.KeepAlive != defKeepAlive {
+		t.Errorf("Dialer.KeepAlive 零值应回落 %v，实际 %v", defKeepAlive, def.KeepAlive)
+	}
+}
+
+// h2 健康检查必须真的按配置生效。
+//
+// 这两个值无法从 *http.Transport 读回（ConfigureTransports 的返回值是
+// 唯一句柄），因此断言只能落在赋值这一步 —— 而「配了没效果」正是
+// 把它们从硬编码提升为配置项的原因，测试必须覆盖到位。
+func TestH2HealthCheckFromConfig(t *testing.T) {
+	h2 := applyH2HealthCheck(&http.Transport{}, config.Transport{
+		H2IdleTimeout: 300 * time.Second,
+		H2PingTimeout: 60 * time.Second,
+	}, nil)
+	if h2 == nil {
+		t.Fatal("h2 未配置成功")
+	}
+	if h2.ReadIdleTimeout != 300*time.Second {
+		t.Errorf("ReadIdleTimeout = %v, want 300s", h2.ReadIdleTimeout)
+	}
+	if h2.PingTimeout != 60*time.Second {
+		t.Errorf("PingTimeout = %v, want 60s", h2.PingTimeout)
+	}
+}
+
+// 零值表示**关闭** h2 健康检查，而不是回落到某个 PING 间隔。
+//
+// 方向必须取「关」：PING 无应答会关掉整条连接、连带其上所有复用中的流
+// 一起失败，所以「没有明确配置」时宁可不管，也不要凭空给一个可能误杀的阈值。
+func TestH2HealthCheckZeroDisablesPing(t *testing.T) {
+	h2 := applyH2HealthCheck(&http.Transport{}, config.Transport{}, nil)
+	if h2 == nil {
+		t.Fatal("h2 未配置成功")
+	}
+	if h2.ReadIdleTimeout != 0 {
+		t.Errorf("ReadIdleTimeout = %v，零值必须是关闭（0）", h2.ReadIdleTimeout)
+	}
+}

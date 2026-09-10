@@ -15,8 +15,8 @@ type testTransformer struct {
 	public string
 }
 
-func (t testTransformer) Data(p []byte) ([]byte, bool) {
-	return t.spec.Sanitize(p, t.public, t.rep)
+func (t testTransformer) Data(p []byte) ([]byte, SanitizeReport) {
+	return t.spec.SanitizeWithReport(p, t.public, t.rep)
 }
 
 func newTr(t testing.TB, path string) testTransformer {

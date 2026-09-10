@@ -197,6 +197,25 @@ func envDur(key string, def time.Duration) time.Duration {
 	return def
 }
 
+// envDurAllowZero 与 envDur 相同，但把 0 视为有效取值。
+//
+// 用于 0 有明确语义（「关闭」）而非「未设置」的开关，
+// 例如 UPSTREAM_H2_IDLE_TIMEOUT=0 表示关掉 h2 的 PING 健康检查。
+// 判据同样是「值非空」：未设置才回落到 def。
+func envDurAllowZero(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
 func envFloat(key string, def float64) float64 {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {

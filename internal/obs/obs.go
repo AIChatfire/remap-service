@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -132,6 +133,27 @@ func (p *Provider) Enabled() bool { return p != nil && p.enabled }
 
 // LogUpstreamModel 报告是否允许在日志中记录真实上游模型。
 func (p *Provider) LogUpstreamModel() bool { return p != nil && p.logUpstream }
+
+// CountH2Error 记录一次 h2 传输层的连接级内部事件。
+//
+// 它**不属于任何请求的 span**：事件发生在连接上，而一条连接会被多个请求
+// 复用，写进某个请求的 span 等于随机归因。所以只能走指标。
+//
+// 最要紧的 kind 是 conn_close_lost_ping —— 它表示网关自己判定连接死亡并
+// 关掉了整条连接，其上**所有**在途流会一起失败，错误串为
+// "http2: client connection lost"，而它在错误分类上与「上游不可达」完全同形
+// （都落到 502 upstream connection failed）。这个计数是回答
+// 「PING 探活到底触发过没有、触发了几次」的唯一直接证据。
+//
+// 由 upstream 层以回调形式注入（见 upstream.H2ErrorReporter），
+// obs 不反向依赖 upstream。
+func (p *Provider) CountH2Error(kind string) {
+	if p == nil || p.Metrics == nil || kind == "" {
+		return
+	}
+	Add(context.Background(), p.Metrics.H2ConnErrors, 1,
+		metric.WithAttributes(attribute.String("kind", kind)))
+}
 
 // New 依据配置初始化可观测性。返回的 Provider 永远非 nil。
 func New(ctx context.Context, c config.Obs) (*Provider, error) {

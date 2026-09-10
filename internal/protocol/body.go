@@ -38,6 +38,22 @@ func RewriteModel(body []byte, upstream string) ([]byte, error) {
 // maxScanDepth 限制递归扫描深度，防御畸形的深层嵌套 JSON。
 const maxScanDepth = 12
 
+// SanitizeReport 描述一次脱敏的结果。
+type SanitizeReport struct {
+	// Changed 报告本次是否改写了任何字段（模型字段整体覆盖 或 子串替换），
+	// 与旧版 Sanitize 的第二个返回值同义。
+	Changed bool
+	// Suppressed 报告「上游标识确实出现在响应里，但一次都没被改写」。
+	//
+	// 只有一种规则会造成它：长度阈值（见 collect 里的 MaxValueLen 判断）。
+	// 生成内容字段被跳过**不算** —— 那是设计意图，计进来信号就永远非零了。
+	//
+	// 它值得单独一个信号，是因为这个漏点是静默的：客户端拿到的是原文，
+	// 看板上既没有错误也没有计数，只能等有人肉眼发现真实上游名出现在
+	// 对外响应里。而最容易踩中的正是上游的长错误 message。
+	Suppressed bool
+}
+
 // Sanitize 对一段 JSON 响应做脱敏，分两步：
 //
 //	① 模型字段（协议已知路径）整体覆盖为 public —— 精确、无副作用；
@@ -55,9 +71,19 @@ const maxScanDepth = 12
 // 可能夹着上游标识」。让 ② 再扫一遍 ① 的成果没有任何收益，却会在对外名
 // 包含上游名时（public=DeepSeek-V3-20260813 含 upstream=deepseek-v3）
 // 把已经正确的值再替换一次，产出 …-20260813-20260813 这样的重复后缀。
+//
+// 不关心抑制信号的调用方用这个包装即可。
 func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]byte, bool) {
+	out, report := s.SanitizeWithReport(body, public, rep)
+	return out, report.Changed
+}
+
+// SanitizeWithReport 与 Sanitize 相同，但额外回报「被跳过的漏点」。
+func (s *Spec) SanitizeWithReport(
+	body []byte, public string, rep *sanitize.Replacer,
+) ([]byte, SanitizeReport) {
 	out := body
-	changed := false
+	var report SanitizeReport
 
 	// covered 记录已被 ① 整体覆盖的路径，② 必须跳过它们。
 	// ModelPaths 恒为个位数，线性查找比建 map 更快且零分配。
@@ -79,17 +105,22 @@ func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]b
 			continue
 		}
 		if v, err := sjson.SetBytesOptions(out, p, public, setOpts); err == nil {
-			out, changed = v, true
+			out, report.Changed = v, true
 		}
 	}
 
 	// ② 其余短值：仅在确实可能命中时才扫描，避免无谓的解析开销。
-	if rep.MayMatch(out) {
-		if v, ok := scanAndReplace(out, rep, covered); ok {
-			out, changed = v, true
+	//
+	// 抑制信号只在「确实扫过」的前提下才可信：MayMatch 判负说明整段文本里
+	// 根本没有上游标识，此时零替换是正确结果，不是漏点。
+	if !rep.Noop() && rep.MayMatch(out) {
+		v, ok, suppressed := scanAndReplace(out, rep, covered)
+		report.Suppressed = suppressed
+		if ok {
+			out, report.Changed = v, true
 		}
 	}
-	return out, changed
+	return out, report
 }
 
 // scanAndReplace 递归遍历 JSON，替换符合条件的字符串值。
@@ -99,29 +130,40 @@ func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]b
 //   - 值长度不超过 rep.MaxValueLen()；
 //   - 所在字段名不在生成内容白名单里（content / text / delta …）；
 //   - 所在路径不在 covered 里（已被模型字段覆盖步骤处理过）。
-func scanAndReplace(body []byte, rep *sanitize.Replacer, covered []string) ([]byte, bool) {
+//
+// 第三个返回值 suppressed 表示本次遇到过「含上游标识、但被长度阈值放行」
+// 的值 —— 即真正的静默漏点。它与 ok 可以同时为真：一次响应里既有被改写
+// 的短值，也有被放行的长值。
+func scanAndReplace(body []byte, rep *sanitize.Replacer, covered []string) (out []byte, ok, suppressed bool) {
 	var paths []string
 	var values []string
 
-	collect(gjson.ParseBytes(body), "", "", rep, covered, 0, &paths, &values)
+	collect(gjson.ParseBytes(body), "", "", rep, covered, 0, &paths, &values, &suppressed)
 	if len(paths) == 0 {
-		return body, false
+		return body, false, suppressed
 	}
 
-	out := body
+	out = body
 	for i, p := range paths {
 		if v, err := sjson.SetBytesOptions(out, p, values[i], setOpts); err == nil {
 			out = v
 		}
 	}
-	return out, true
+	return out, true, suppressed
 }
 
 // collect 递归收集需要改写的路径与新值。
 //
 // path 为 sjson 路径，key 为当前值所属的字段名（数组元素继承父字段名，
 // 因为 ["a","b"] 这类数组里的元素同样属于该字段的语义范畴）。
-func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, covered []string, depth int, paths, values *[]string) {
+//
+// suppressed 在「含上游标识但被长度阈值放行」时置位。判定放在长度分支内、
+// 且只对非生成内容字段生效，因此代价只在「出现超长非内容字符串」这种
+// 低频形态上产生 —— 热路径（SSE 增量 chunk）不会走到这里。
+func collect(
+	v gjson.Result, path, key string, rep *sanitize.Replacer, covered []string,
+	depth int, paths, values *[]string, suppressed *bool,
+) {
 	if depth > maxScanDepth {
 		return
 	}
@@ -134,7 +176,15 @@ func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, covered [
 			return // 模型字段已整体覆盖，二次子串替换只会产生重复片段
 		}
 		if len(v.Str) > rep.MaxValueLen() {
-			return // 过长，视为生成内容
+			// 过长，视为生成内容而放行 —— 这是有意的，但它是**静默**的：
+			// 上游的长错误 message 正落在这个区间（配额超限、多行校验错误、
+			// 回显了整个请求的 400），而它们往往含真实上游模型名。
+			// 这里顺手判一次「里面到底有没有标识」，把静默漏点变成可测量
+			// 的计数；判定只在已经超长的值上发生，不影响热路径。
+			if rep.MayMatchString(v.Str) {
+				*suppressed = true
+			}
+			return
 		}
 		nv := rep.Apply(v.Str)
 		if nv != v.Str {
@@ -145,7 +195,7 @@ func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, covered [
 		if v.IsArray() {
 			i := 0
 			v.ForEach(func(_, item gjson.Result) bool {
-				collect(item, joinIndex(path, i), key, rep, covered, depth+1, paths, values)
+				collect(item, joinIndex(path, i), key, rep, covered, depth+1, paths, values, suppressed)
 				i++
 				return true
 			})
@@ -153,7 +203,7 @@ func collect(v gjson.Result, path, key string, rep *sanitize.Replacer, covered [
 		}
 		v.ForEach(func(k, item gjson.Result) bool {
 			name := k.String()
-			collect(item, joinKey(path, name), name, rep, covered, depth+1, paths, values)
+			collect(item, joinKey(path, name), name, rep, covered, depth+1, paths, values, suppressed)
 			return true
 		})
 	}

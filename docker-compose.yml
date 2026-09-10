@@ -32,15 +32,65 @@ services:
     env_file:
       - .env
     healthcheck:
-      # distroless 无 shell/curl，用网关自身的 -check 做静态校验；
-      # 存活性交给编排层的 TCP 探针或 /healthz HTTP 探针。
-      test: ["CMD", "/gateway", "-check"]
+      # 用网关自己的 -healthcheck 探本机 /healthz（进程内自探）。
+      #
+      # 为什么不是 -check：那是**启动期的静态配置校验**，每次都重新读一遍
+      # .env 并校验语法，与「进程还能不能转发请求」完全无关 —— 网关死锁、
+      # goroutine 全卡、不再 accept 时它照样返回 0，于是 restart 永不触发，
+      # 等价于没有存活检查。
+      #
+      # 为什么不是 TCP / HTTP 探针：distroless 镜像里没有 curl / wget / shell，
+      # 编排层的探针只能调用镜像内已有的命令，所以这件事必须由二进制自己做。
+      test: ["CMD", "/gateway", "-healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
-    stop_grace_period: 30s   # 留足时间摘流量 + 放完在途的长请求（LLM 单请求可达数十秒）
+    # 内存上限：既是爆炸半径控制，也是 GOMEMLIMIT 的唯一基准来源
+    # （进程读 cgroup 上限并按 80% 设软内存上限，见 internal/memlimit）。
+    # 不设上限时这两件事同时失效：GOMEMLIMIT 无从取值，而 GOGC=300 本身
+    # 是「堆涨到 live set 的 4 倍且无天花板」。
+    #
+    # 取值要连同 MAX_INFLIGHT / MAX_BODY_BYTES 一起看：MAX_INFLIGHT 数的是
+    # 「条数」，内存按「字节」消耗，所以真正的护栏是这一行，不是那个数。
+    # ⚠️ 改这里就等于改软内存上限，无需（也不要）另外手填 GOMEMLIMIT ——
+    #    两个数各写一遍必然漂移，而漂移的表现是「改了没效果」。
+    mem_limit: ${CONTAINER_MEMORY:-2g}
+    # 与 mem_limit 相等 = 容器内禁用 swap。否则超限时先被换出、表现为
+    # 延迟暴涨而不是干脆的 OOM，问题从「重启」退化成「全站变慢」。
+    memswap_limit: ${CONTAINER_MEMORY:-2g}
+    # 必须 ≥ 进程自己的退出预算（SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT +
+    # SHUTDOWN_FLUSH_TIMEOUT，默认 5s+20s+5s=30s），否则最后一段遥测 flush
+    # 会被 SIGKILL 掐掉 —— 它是三段里唯一「不做就永久丢数据」的一段。
+    # 进程把三段之和打进启动日志（shutdown_budget_total），据此核对。
+    stop_grace_period: 45s   # 30s 预算 + 15s 余量
     logging: *default-logging
+    # 文件描述符上限必须显式声明，不能依赖「容器默认继承宿主机」。
+    #
+    # 实测：不写时容器继承的是 **dockerd 的** limits，而不是宿主机的 ——
+    # 官方 systemd unit 里 dockerd 的 LimitNOFILE=infinity，因此容器内
+    # 实测为 1048576/1048576。这条链路有两处断点：
+    #   1. dockerd 的 limits 由它的启动环境决定。非 systemd 方式启动
+    #      （直接 `dockerd &`、Docker-in-Docker、某些发行版包）会继承
+    #      启动它的那个 shell，完全可能就是 1024；
+    #   2. 本镜像以 nonroot 运行，且下面 drop 了全部 capability ——
+    #      抬高硬限制需要 CAP_SYS_RESOURCE，非 root 进程**无权**自行调整，
+    #      进了容器再改已经晚了。
+    #
+    # 取值说明：65536 相对本机默认的 1048576 是一次**收紧**，这是有意的 ——
+    # 目标是「一个确定的、跨环境一致的上限」，而非「尽可能大」。它足以覆盖
+    # 最坏情形：h2 不可用回落 HTTP/1.1 时连接数 ≈ MAX_INFLIGHT(10240)，
+    # 再加每个 per-request 代理各自的一份池。
+    # 若压测出现 EMFILE（open ...: too many open files），
+    # 应连同 MAX_INFLIGHT / MAX_CONNS 一起评估，而不是单独抬这个数。
+    # ⚠️ 硬限制不得超过 dockerd 自身，否则容器直接起不来 ——
+    #    这也正是不直接抄 1048576 的原因：换个 daemon 上限更低的宿主机会启动失败。
+    # 未设 nproc：它限制的是「同一 UID 的进程/线程数」，本服务是 goroutine
+    # 密集型，由 Go 运行时复用少量线程，不构成瓶颈。
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     security_opt:
       - no-new-privileges:true
     read_only: true          # 镜像里只有一个静态二进制，运行期无需写盘

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/betterme/remap-service/internal/config"
 )
 
 // countingRT 记录默认出口被调用的次数。
@@ -22,7 +24,7 @@ func (c *countingRT) RoundTrip(*http.Request) (*http.Response, error) {
 
 func newRouterFixture() (*Router, *countingRT) {
 	def := &countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}
-	return NewRouter(def, 0, ""), def
+	return NewRouter(def, 0, config.Transport{}, "", nil), def
 }
 
 // 未声明代理时必须原样走默认出口。
@@ -117,7 +119,7 @@ func TestRouterRoutesThroughProxy(t *testing.T) {
 	}))
 	defer px.Close()
 
-	r := NewRouter(&countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}, 0, "")
+	r := NewRouter(&countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}, 0, config.Transport{}, "", nil)
 	defer r.CloseIdleConnections()
 
 	// 目标是一个不存在的地址，只有真的过了代理才可能成功。
@@ -183,7 +185,7 @@ func TestRouterPerRequestProxyHonorsNoProxy(t *testing.T) {
 
 	// 代理指向一个不可达地址：只有真的绕过代理直连 origin 才可能成功。
 	r := NewRouter(&countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}},
-		0, "127.0.0.1")
+		0, config.Transport{}, "127.0.0.1", nil)
 	defer r.CloseIdleConnections()
 
 	req, _ := http.NewRequest(http.MethodGet, origin.URL+"/v1/models", nil)

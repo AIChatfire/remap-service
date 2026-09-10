@@ -29,8 +29,8 @@ type transformer struct {
 	public string
 }
 
-func (t transformer) Data(payload []byte) ([]byte, bool) {
-	return t.spec.Sanitize(payload, t.public, t.rep)
+func (t transformer) Data(payload []byte) ([]byte, protocol.SanitizeReport) {
+	return t.spec.SanitizeWithReport(payload, t.public, t.rep)
 }
 
 // pipeStream 转发 SSE 流式响应，逐 chunk 脱敏并即时 flush。
@@ -81,9 +81,13 @@ func (g *Gateway) pipeStream(
 	obs.Add(ctx, st.mx.SSEEvents, stats.Events, a)
 	obs.Add(ctx, st.mx.BytesOut, stats.Bytes, a)
 	obs.Add(ctx, st.mx.Rewrites, stats.Rewrote, a)
+	// 抑制信号与改写数并列上报：单看任何一个都分不清「响应里根本没出现
+	// 上游标识」与「出现了但全被长度阈值放行」。后者是唯一的静默漏点。
+	obs.Add(ctx, st.mx.SanitizeSuppressed, stats.Suppressed, a)
 	span.SetAttributes(
 		attribute.Int64("gateway.sse.events", stats.Events),
 		attribute.Int64("gateway.sse.bytes", stats.Bytes),
+		attribute.Int64("gateway.sanitize.suppressed", stats.Suppressed),
 	)
 
 	if err != nil {
@@ -215,11 +219,21 @@ func (g *Gateway) pipeBuffered(
 	// 此时 rep 可能为 nil（脱敏关闭或请求无 model 字段），无条件调用
 	// Sanitize 等于在关闭脱敏的部署里悄悄启用它。
 	out := body
+	suppressed := false
 	if needSanitize && protocol.LooksLikeJSON(body) {
-		if nb, changed := spec.Sanitize(body, st.publicModel, rep); changed {
+		nb, report := spec.SanitizeWithReport(body, st.publicModel, rep)
+		suppressed = report.Suppressed
+		if report.Changed {
 			out = nb
 			st.rewrites++
 		}
+	}
+	// 非流式这条路径最容易踩到长度阈值：上游的长错误 message（配额超限、
+	// 多行校验错误、回显了整个请求的 400）几乎都超过 SANITIZE_MAX_VALUE_LEN，
+	// 因而被整体放行。落一个计数 + span 属性，让「静默漏点」可被筛出来。
+	if suppressed {
+		obs.Add(ctx, st.mx.SanitizeSuppressed, 1, st.metricAttrs(st.outcome, resp.StatusCode))
+		span.SetAttributes(attribute.Bool("gateway.sanitize.suppressed", true))
 	}
 
 	w.Header().Set("Content-Length", strconv.Itoa(len(out)))

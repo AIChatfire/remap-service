@@ -15,6 +15,10 @@ var allEnvKeys = []string{
 	"UPSTREAM_STREAM_TIMEOUT", "UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM",
 	"UPSTREAM_STALL_TIMEOUT",
 	"UPSTREAM_PROXY", "UPSTREAM_PROXY_FROM_HEADER", "UPSTREAM_NO_PROXY",
+	"UPSTREAM_IDLE_CONN_TIMEOUT", "UPSTREAM_DIAL_TIMEOUT", "UPSTREAM_TCP_KEEPALIVE",
+	"UPSTREAM_TLS_HANDSHAKE_TIMEOUT", "UPSTREAM_MAX_CONNS_PER_HOST",
+	"UPSTREAM_WRITE_BUFFER", "UPSTREAM_READ_BUFFER",
+	"UPSTREAM_H2_IDLE_TIMEOUT", "UPSTREAM_H2_PING_TIMEOUT",
 	"UPSTREAM_BASE_OPENAI", "UPSTREAM_BASE_RESPONSES", "UPSTREAM_BASE_ANTHROPIC",
 	"MODEL_MAP", "MODEL_MAP_STRICT", "MODEL_MAP_FALLBACK", "MODEL_MAP_FAILOVER",
 	"MODEL_CAPABILITY",
@@ -459,5 +463,139 @@ func TestSummaryHasNoSecrets(t *testing.T) {
 	}
 	if !found {
 		t.Error("摘要应标明是否存在兜底 Key")
+	}
+}
+
+// 传输层参数必须能从环境变量读入。
+//
+// 这几个键在此之前是硬编码在 upstream.newTransport 里的，结果是排查时
+// 能定位到「就是这个参数」却无法处置。这个测试守住「键名接对了」——
+// 键名写错不会有任何报错，只会静默沿用内置默认。
+func TestTransportParamsFromEnv(t *testing.T) {
+	isolate(t)
+	p := writeEnv(t, `
+UPSTREAM_BASE=https://x.com
+UPSTREAM_IDLE_CONN_TIMEOUT=30s
+UPSTREAM_DIAL_TIMEOUT=12s
+UPSTREAM_TCP_KEEPALIVE=45s
+UPSTREAM_TLS_HANDSHAKE_TIMEOUT=9s
+UPSTREAM_MAX_CONNS_PER_HOST=512
+UPSTREAM_WRITE_BUFFER=16KB
+UPSTREAM_READ_BUFFER=8KB
+UPSTREAM_H2_IDLE_TIMEOUT=210s
+UPSTREAM_H2_PING_TIMEOUT=45s
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.Transport
+	if got.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout = %v", got.IdleConnTimeout)
+	}
+	if got.DialTimeout != 12*time.Second {
+		t.Errorf("DialTimeout = %v", got.DialTimeout)
+	}
+	if got.KeepAlive != 45*time.Second {
+		t.Errorf("KeepAlive = %v", got.KeepAlive)
+	}
+	if got.TLSHandshakeTimeout != 9*time.Second {
+		t.Errorf("TLSHandshakeTimeout = %v", got.TLSHandshakeTimeout)
+	}
+	if got.MaxConnsPerHost != 512 {
+		t.Errorf("MaxConnsPerHost = %d", got.MaxConnsPerHost)
+	}
+	if got.WriteBufferSize != 16<<10 || got.ReadBufferSize != 8<<10 {
+		t.Errorf("缓冲 = %d/%d", got.WriteBufferSize, got.ReadBufferSize)
+	}
+	if got.H2IdleTimeout != 210*time.Second || got.H2PingTimeout != 45*time.Second {
+		t.Errorf("h2 健康检查 = %v/%v", got.H2IdleTimeout, got.H2PingTimeout)
+	}
+}
+
+// h2 健康检查的默认值必须由非流式首字节预算推导，且「空闲 + PING 容忍」
+// 严格大于该预算。
+//
+// 这条守的是最容易配反的一个方向：h2 在应用层看门狗之前关连接时，
+// 报错退化成 `client connection lost` —— 与「上游不可达」同形，
+// 排查方向会被整个带偏。推导关系让「改了非流式预算」自动同步，
+// 不会出现改了 A 忘了 B 的静默错配。
+func TestH2HealthCheckDefaultFollowsNonStreamBudget(t *testing.T) {
+	cases := []struct {
+		name      string
+		nonStream string
+	}{
+		{"默认预算", ""},
+		{"自定义预算", "120s"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			isolate(t)
+			t.Setenv("UPSTREAM_BASE", "https://x.com")
+			if c.nonStream != "" {
+				t.Setenv("UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM", c.nonStream)
+			}
+			cfg, err := Load("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Transport.H2IdleTimeout != cfg.Upstream.FirstByteTimeoutNonStream {
+				t.Errorf("H2IdleTimeout = %v，应等于非流式首字节预算 %v",
+					cfg.Transport.H2IdleTimeout, cfg.Upstream.FirstByteTimeoutNonStream)
+			}
+			sum := cfg.Transport.H2IdleTimeout + cfg.Transport.H2PingTimeout
+			if sum <= cfg.Upstream.FirstByteTimeoutNonStream {
+				t.Errorf("空闲+PING 容忍 = %v，必须严格大于非流式预算 %v，"+
+					"否则 h2 会在应用层看门狗之前误杀长静默的连接",
+					sum, cfg.Upstream.FirstByteTimeoutNonStream)
+			}
+		})
+	}
+}
+
+// 显式写 0 表示关闭 h2 健康检查，必须被尊重，不能被推导默认值覆盖。
+//
+// 这与 OBS_ENABLED=false 压制自动启用同一条口径：显式值优先于推断。
+func TestH2HealthCheckExplicitZeroDisables(t *testing.T) {
+	isolate(t)
+	t.Setenv("UPSTREAM_BASE", "https://x.com")
+	t.Setenv("UPSTREAM_H2_IDLE_TIMEOUT", "0")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Transport.H2IdleTimeout != 0 {
+		t.Errorf("H2IdleTimeout = %v，显式 0 应表示关闭",
+			c.Transport.H2IdleTimeout)
+	}
+}
+
+// 传输层参数必须出现在启动日志里。
+//
+// 与超时那几项同一个理由：这些键写错不会有任何报错，只会静默沿用内置默认，
+// 表现是「改了半天没效果」。启动日志是唯一的低成本判别依据。
+func TestSummaryIncludesTransportParams(t *testing.T) {
+	isolate(t)
+	t.Setenv("UPSTREAM_BASE", "https://x.com")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"idle_conn_timeout": false, "dial_timeout": false,
+		"tls_handshake_timeout": false, "max_conns_per_host": false,
+		"h2_idle_timeout": false, "h2_ping_timeout": false,
+	}
+	for i, v := range c.Summary() {
+		if k, ok := v.(string); ok && i+1 < len(c.Summary()) {
+			if _, tracked := want[k]; tracked {
+				want[k] = true
+			}
+		}
+	}
+	for k, seen := range want {
+		if !seen {
+			t.Errorf("启动摘要缺少 %s", k)
+		}
 	}
 }

@@ -30,7 +30,7 @@ LABEL org.opencontainers.image.source="https://github.com/AIChatfire/remap-servi
 COPY --from=builder /out/gateway /gateway
 
 USER nonroot:nonroot
-EXPOSE 8080 9090
+EXPOSE 8080
 
 # 全部配置来自环境变量。挂载 .env 到 /app/.env 或直接用 -e 传入。
 WORKDIR /app

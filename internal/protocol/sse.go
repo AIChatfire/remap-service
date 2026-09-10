@@ -14,6 +14,10 @@ type SSEStats struct {
 	Bytes   int64
 	Chunks  int64
 	Rewrote int64
+	// Suppressed 是「载荷里出现上游标识但零替换」的行数，见 SanitizeReport。
+	// 与 Rewrote 并列上报：只有两者一起看，才能分辨「没出现标识」与
+	// 「出现了但全被长度阈值放行」——后者就是那个静默漏点。
+	Suppressed int64
 }
 
 var (
@@ -38,8 +42,8 @@ var (
 // 只作用于 data 行的 JSON 载荷：event / id / retry / 注释行原样保留。
 // 上游不会把模型名写进事件名，对它们做替换只会平添破坏协议的风险。
 type Transformer interface {
-	// Data 对 JSON 载荷做脱敏，返回新载荷与是否发生改动。
-	Data(payload []byte) ([]byte, bool)
+	// Data 对 JSON 载荷做脱敏，返回新载荷与本次的脱敏结果。
+	Data(payload []byte) ([]byte, SanitizeReport)
 }
 
 // PipeSSE 从 src 逐行读取 SSE，经 tr 脱敏后写入 dst，并在事件边界立即 flush。
@@ -85,9 +89,12 @@ func PipeSSE(dst io.Writer, src io.Reader, tr Transformer, flusher http.Flusher)
 				}
 				flush()
 			} else {
-				out, rewrote := transformLine(line, tr)
+				out, rewrote, suppressed := transformLine(line, tr)
 				if rewrote {
 					st.Rewrote++
+				}
+				if suppressed {
+					st.Suppressed++
 				}
 				st.Chunks++
 				if _, werr := bw.Write(out); werr != nil {
@@ -113,9 +120,9 @@ func PipeSSE(dst io.Writer, src io.Reader, tr Transformer, flusher http.Flusher)
 }
 
 // transformLine 只处理 data 行的 JSON 载荷，其余行原样返回。
-func transformLine(line []byte, tr Transformer) (out []byte, rewrote bool) {
+func transformLine(line []byte, tr Transformer) (out []byte, rewrote, suppressed bool) {
 	if tr == nil || !bytes.HasPrefix(line, dataPrefix) {
-		return line, false
+		return line, false, false
 	}
 	payload := line[len(dataPrefix):]
 
@@ -126,18 +133,18 @@ func transformLine(line []byte, tr Transformer) (out []byte, rewrote bool) {
 	}
 	body := payload[lead:]
 	if len(body) == 0 || bytes.Equal(body, doneMarker) || !LooksLikeJSON(body) {
-		return line, false
+		return line, false, false
 	}
 
-	nb, changed := tr.Data(body)
-	if !changed {
-		return line, false
+	nb, report := tr.Data(body)
+	if !report.Changed {
+		return line, false, report.Suppressed
 	}
 	buf := make([]byte, 0, len(dataPrefix)+lead+len(nb))
 	buf = append(buf, dataPrefix...)
 	buf = append(buf, payload[:lead]...)
 	buf = append(buf, nb...)
-	return buf, true
+	return buf, true, report.Suppressed
 }
 
 // readLine 读取一整行（去掉行尾 \n 与 \r），处理超长行。

@@ -28,6 +28,37 @@ type Metrics struct {
 	// Failover 是切换到兜底模型的次数。它上升说明首选上游在报错，
 	// 客户端侧可能感知不到，只能靠这个指标发现。
 	Failover metric.Int64Counter
+	// H2ConnErrors 是 h2 传输层的**连接级**内部事件计数，标签是 kind。
+	//
+	// 与 UpstreamErr 的差别是粒度：那个数「请求」，这个数「连接」。
+	// 事件名由 x/net/http2 封闭定义（conn_close_lost_ping、recv_goaway_*、
+	// 读帧错误等），种类有限，可安全当标签用。
+	//
+	// 为什么要单独一个指标：一次 conn_close_lost_ping 会让该连接上
+	// **所有**在途流一起失败，于是它成了请求级错误的放大器 ——
+	// 两者一起看才能分清「挂了一个请求」与「挂了一条连接、连带几十个请求」。
+	H2ConnErrors metric.Int64Counter
+	// SanitizeSuppressed 是「上游标识确实出现在响应里、但一次都没被替换」的
+	// 计数 —— 唯一的静默漏点。
+	//
+	// 唯一会走到这里的规则是长度阈值（SANITIZE_MAX_VALUE_LEN）：超过阈值的
+	// 值被视为模型生成的内容而整体放行。上游的长错误 message（配额超限、
+	// 多行校验错误、回显了整个请求的 400）正落在这个区间里，而它们恰恰是
+	// 最需要脱敏的一类文本（含真实上游模型名）。
+	//
+	// 稳态下应恒为 0 —— model 字段是整体覆盖的、必然发生替换。一旦非零，
+	// 就说明有标识**只**出现在长字段里，需要人工判断「是漏了还是本来就该放过」。
+	// 这是把「静默漏点」变成「可测量的漏点」，不放松任何现有保护。
+	//
+	// 刻意不统计「生成内容字段被跳过」：那是设计意图（绝不篡改模型输出），
+	// 把它计进来会让这条信号永远非零、从而失去意义。
+	SanitizeSuppressed metric.Int64Counter
+	// Panics 是 recoverMW 拦下的 panic 数。
+	//
+	// panic 此前只有一行日志，「这个月发生过几次」无从回答；而它每次都会
+	// 让一个请求以一个结构可能已损坏的响应收场。计数为 0 与「没有实现」
+	// 才是真的同形 —— 那正是要避免的。
+	Panics metric.Int64Counter
 }
 
 func newMetrics(m metric.Meter) (*Metrics, error) {
@@ -74,6 +105,15 @@ func newMetrics(m metric.Meter) (*Metrics, error) {
 	pick(e)
 	out.Failover, e = m.Int64Counter("gateway.model.failover",
 		metric.WithDescription("首选上游失败后切换到兜底模型的次数"))
+	pick(e)
+	out.H2ConnErrors, e = m.Int64Counter("gateway.upstream.h2_conn_errors",
+		metric.WithDescription("h2 传输层连接级事件数（PING 探活失败、GOAWAY、读帧错误等）"))
+	pick(e)
+	out.SanitizeSuppressed, e = m.Int64Counter("gateway.sanitize.suppressed",
+		metric.WithDescription("响应里出现上游标识但零替换的次数（长度阈值放行的静默漏点）"))
+	pick(e)
+	out.Panics, e = m.Int64Counter("gateway.panics",
+		metric.WithDescription("请求处理中 panic 被 recover 的次数"))
 	pick(e)
 
 	if err != nil {

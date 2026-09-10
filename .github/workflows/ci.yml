@@ -174,6 +174,33 @@ jobs:
           docker run --rm remap-gateway:ci -version
           docker run --rm -e UPSTREAM_BASE=https://example.com/v1 remap-gateway:ci -check
 
+      # 上面两条都是**立刻退出**的路径，main 里的 server.Run 一次都没执行 ——
+      # 监听端口没绑定、路由没注册、/healthz 挂掉这几类问题它们全都拦不住。
+      # 这里真起服务，并用容器内自带的 -healthcheck 探一次 /healthz。
+      #
+      # 就绪判定必须是「真能探通」，不能 grep 启动日志：启动日志早于监听打印，
+      # 启动失败时它同样会出现在输出里。
+      #
+      # 显式指定 ADDR：探针读的是容器内的 ADDR，两者必须同源，否则探的是
+      # 一个没人监听的端口（而这正是生产里最容易被踩的形态）。
+      - name: 冒烟 - 起服务并自探 /healthz
+        run: |
+          set -euo pipefail
+          docker run -d --name gw-smoke \
+            -e ADDR=:18983 -e UPSTREAM_BASE=https://example.com/v1 \
+            remap-gateway:ci
+          ok=0
+          for _ in $(seq 1 30); do
+            if docker exec gw-smoke /gateway -healthcheck; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs gw-smoke || true
+          docker rm -f gw-smoke >/dev/null
+          if [ "$ok" != "1" ]; then
+            echo "自探 /healthz 失败：进程起来了但探不通" >&2
+            exit 1
+          fi
+
       # compose 文件写错会在部署时才暴露，CI 里静态展开一次即可拦住。
       - name: 校验 compose 语法
         run: |

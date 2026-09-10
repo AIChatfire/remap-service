@@ -42,7 +42,7 @@ func TestLiveProxySchemes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s 校验失败: %v", scheme, err)
 		}
-		rt := NewRoundTripper(64, config.Upstream{Proxy: norm})
+		rt := NewRoundTripper(64, config.Transport{}, config.Upstream{Proxy: norm}, nil)
 		hc := &http.Client{Transport: rt, Timeout: 30 * time.Second}
 		ip, proto := egressIP(t, hc, "https://api.ipify.org")
 		rt.CloseIdleConnections()
@@ -62,7 +62,7 @@ func TestLivePerRequestProxy(t *testing.T) {
 		t.Fatalf("校验失败: %v", err)
 	}
 	// 默认出口不配代理
-	rt := NewRoundTripper(64, config.Upstream{})
+	rt := NewRoundTripper(64, config.Transport{}, config.Upstream{}, nil)
 	defer rt.CloseIdleConnections()
 	hc := &http.Client{Transport: rt, Timeout: 30 * time.Second}
 
@@ -96,7 +96,7 @@ func TestLiveNoProxyBypass(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	rt := NewRoundTripper(64, config.Upstream{Proxy: norm, NoProxy: "127.0.0.1,localhost,::1"})
+	rt := NewRoundTripper(64, config.Transport{}, config.Upstream{Proxy: norm, NoProxy: "127.0.0.1,localhost,::1"}, nil)
 	defer rt.CloseIdleConnections()
 	hc := &http.Client{Transport: rt, Timeout: 30 * time.Second}
 

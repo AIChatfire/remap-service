@@ -77,30 +77,98 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	// 先摘流量（readyz 转 503），给负载均衡器反应时间，再关闭连接。
+	// 先摘流量（readyz 转 503），等负载均衡器探测到这个 503 再关闭连接。
+	//
+	// 这里的等待不能省：LB 的健康检查间隔通常 5~10s，在此之前它仍会把新请求
+	// 打到本实例上，而那些请求会直接撞上正在关停的进程（502 / 连接被拒），
+	// 在 LB 层面表现为「这个实例偶发错误」。此前注释写了「给负载均衡器反应
+	// 时间」但代码紧接着就关连接，那段窗口是实际存在的。
+	//
+	// 注意等待期间不响应第二次 SIGTERM（signal.NotifyContext 只取消一次）；
+	// 真正的兜底仍是编排层的 stop_grace_period，超时后 SIGKILL 一定生效。
+	lc := s.cfg.Lifecycle.Effective()
 	s.ready.Store(false)
-	s.o.Logger.Info("开始优雅退出")
-	sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	s.o.Logger.Info("开始优雅退出",
+		slog.String("drain_delay", lc.DrainDelay.String()),
+		slog.String("shutdown_timeout", lc.ShutdownTimeout.String()),
+	)
+	if lc.DrainDelay > 0 {
+		time.Sleep(lc.DrainDelay)
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), lc.ShutdownTimeout)
 	defer cancel()
 	return s.http.Shutdown(sctx)
 }
+
+// statusWriter 记录「响应头是否已经下发」，供 recoverMW 判断还能不能改状态码。
+//
+// 为什么必须完整代理 http.Flusher：本进程的流式转发会直接做
+// `w.(http.Flusher)` 断言（见 gateway.pipeStream），包装后一旦丢掉这个接口，
+// SSE 会退化成「攒满缓冲才发」—— 表现为首字节从毫秒涨到秒级，
+// 而且不报错、不失败，只是端到端延迟变了。Unwrap 供 http.ResponseController
+// 之类的反射式取用（它按 Unwrap 链找真正的 writer）。
+type statusWriter struct {
+	http.ResponseWriter
+	// wrote 只被同一个 goroutine 读写（panic 在同 goroutine 内 recover），
+	// 无需原子操作。
+	wrote bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.wrote = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Write 也置位：隐式 200 同样意味着状态码已经定死，之后不可能再改成 500。
+func (w *statusWriter) Write(b []byte) (int, error) {
+	w.wrote = true
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // recoverMW 拦截 panic，避免单个请求打崩整个进程。
 func recoverMW(o *obs.Provider) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sw := &statusWriter{ResponseWriter: w}
 			defer func() {
-				if rec := recover(); rec != nil {
-					if rec == http.ErrAbortHandler {
-						panic(rec)
-					}
-					o.Logger.Error("请求处理 panic",
-						slog.Any("panic", rec), slog.String("path", r.URL.Path))
-					writeJSON(w, http.StatusInternalServerError,
-						`{"error":{"message":"internal gateway error","type":"gateway_error","param":null,"code":null}}`)
+				rec := recover()
+				if rec == nil {
+					return
 				}
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
+				// panic 只进日志时无法回答「这个月发生过几次」—— 与项目
+				// 「静默失效最难发现」的取向一致，这里补一个计数器。
+				// 用请求 ctx 而非 Background：SpanContext 随之带上，
+				// 看板可以把这次 panic 与那条 trace 对上。
+				obs.Add(r.Context(), o.Metrics.Panics, 1)
+				o.Logger.Error("请求处理 panic",
+					slog.Any("panic", rec), slog.String("path", r.URL.Path),
+					slog.Bool("response_started", sw.wrote))
+
+				// 响应头已经下发过就不能再写错误体：WriteHeader(500) 会被
+				// net/http 记为 superfluous 而不生效，而那段 JSON 会被**直接
+				// 追加**到已经下发的正文里 —— 流式转发中最容易踩到（响应头
+				// 与多个 chunk 早已 flush 出去），结果客户端拿到一段结构损坏
+				// 的响应（合法 SSE 后面跟一坨裸 JSON），而不是一个明确的错误。
+				// 此时只能记日志：连接已定局，唯一的干净收尾是让客户端自己
+				// 判定流被截断。
+				if sw.wrote {
+					return
+				}
+				writeJSON(sw, http.StatusInternalServerError,
+					`{"error":{"message":"internal gateway error","type":"gateway_error","param":null,"code":null}}`)
 			}()
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(sw, r)
 		})
 	}
 }

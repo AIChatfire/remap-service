@@ -1,7 +1,10 @@
 // Package upstream 提供面向高并发的上游 HTTP 客户端。
 //
-// 连接池参数不对外暴露，全部由 config.Limits.MaxConns 一个数字推导：
-// 该值即「单上游主机的空闲连接上限」，全局上限按 4 倍放宽以容纳多协议端点。
+// 连接池**规模**由 config.Limits.MaxConns 一个数字推导（该值即「单上游主机
+// 的空闲连接上限」，全局上限按 4 倍放宽以容纳多协议端点）；而连接**寿命**
+// 与 h2 健康检查没有可推导的正确值 —— 它们取决于上游与网络形态 ——
+// 因此改由 config.Transport 显式配置。这几项配错会直接表现为批量故障
+// （取到半关闭连接、或 h2 误杀长静默的连接），必须可调。
 //
 // 另外两个刻意的默认：
 //   - 关闭自动解压，让响应体以原始字节透传（SSE 场景必须）；
@@ -26,23 +29,38 @@ import (
 	"github.com/betterme/remap-service/internal/config"
 )
 
-// NewTransport 依据连接上限构建可高度复用的 transport。
+// H2ErrorReporter 接收 x/net/http2 报告的**连接级**内部事件。
 //
-// 代理取自 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。显式配置与
-// per-request 代理由 Router 处理，见 proxy.go。
+// 事件名由 x/net/http2 封闭定义。实践中最要紧的是 conn_close_lost_ping：
+// 它意味着 PING 探活没等到 PONG，客户端据此关闭**整条**连接，其上所有
+// 在途流一起拿到 "http2: client connection lost"（这正是该错误串的
+// 唯一产生点，见 closeForLostPing）。recv_goaway_* 与读帧错误同理。
+//
+// 这类事件不属于任何单个请求 —— 一条连接被多个请求复用 —— 因此不适合
+// 写进 span，只能作为指标上报。允许为 nil（零配置入口与测试用）。
+type H2ErrorReporter func(kind string)
+
+// NewTransport 用**内置默认**的传输层参数构建 transport，
+// 代理取自 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。
+//
+// 这是零配置入口（测试与不需要调参的场景）。生产路径是 NewRoundTripper，
+// 它会把 config.Transport 带进来 —— 用错这一个会静默丢掉全部传输层配置，
+// 启动日志里的 idle_conn_timeout / h2_idle_timeout 就是判别依据。
 func NewTransport(maxConns int) *http.Transport {
-	return newTransport(maxConns, http.ProxyFromEnvironment)
+	return newTransport(maxConns, config.Transport{}, http.ProxyFromEnvironment, nil)
 }
 
-// NewRoundTripper 是给 main 用的统一入口：按配置决定默认出口，
+// NewRoundTripper 是给 main 用的统一入口：按配置决定默认出口与传输层参数，
 // 再包一层 Router 以支持 per-request 的 X-Upstream-Proxy。
 //
 // 默认出口的代理来源：UPSTREAM_PROXY 非空则固定走它，否则回落到
 // HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。
 //
+// onH2Err 接收 h2 连接级事件（见 H2ErrorReporter），可为 nil。
+//
 // 返回值同时满足 http.RoundTripper 与 CloseIdleConnections，
 // 可直接交给 NewClient 并在退出时清理。
-func NewRoundTripper(maxConns int, u config.Upstream) *Router {
+func NewRoundTripper(maxConns int, tc config.Transport, u config.Upstream, onH2Err H2ErrorReporter) *Router {
 	proxy := http.ProxyFromEnvironment
 	if p := strings.TrimSpace(u.Proxy); p != "" {
 		// 已在 config.Validate 校验过，这里解析失败只可能是被绕过配置层，
@@ -51,40 +69,98 @@ func NewRoundTripper(maxConns int, u config.Upstream) *Router {
 			proxy = proxyWithBypass(pu, u.NoProxy)
 		}
 	}
-	return NewRouter(newTransport(maxConns, proxy), maxConns, u.NoProxy)
+	return NewRouter(newTransport(maxConns, tc, proxy, onH2Err), maxConns, tc, u.NoProxy, onH2Err)
 }
 
-// newTransport 构建 transport，代理策略由入参决定。
+// 内置默认值：与这些参数被暴露为配置项之前的行为保持一致。
+//
+// 保留一组内置默认（而不是要求全部显式配置）的目的，是让零值的
+// config.Transport —— 手工构造、测试用例 —— 不会静默改变传输层行为。
+// 唯一的例外是 h2 健康检查：它的零值表示「关闭」，方向上是安全的，
+// 原因见 config.Transport.H2IdleTimeout。
+const (
+	defDialTimeout         = 5 * time.Second
+	defKeepAlive           = 30 * time.Second
+	defIdleConnTimeout     = 90 * time.Second
+	defTLSHandshakeTimeout = 10 * time.Second
+	defBufSize             = 64 << 10
+	defH2PingTimeout       = 20 * time.Second
+)
+
+// newTransport 构建 transport，代理策略与传输层参数由入参决定。
 //
 // 每个代理都要一个独立实例，不能用 Clone()：ConfigureTransports 注册的
 // TLSNextProto 处理器会捕获一个共享的 http2.Transport，而后者按 authority
 // 池化连接。Clone 出来的多个代理 transport 共享该池，会把「经代理 A 建立的
 // h2 连接」交给声明走代理 B 的请求 —— 表现为流量静默走错代理。
-func newTransport(maxConns int, proxy func(*http.Request) (*url.URL, error)) *http.Transport {
+func newTransport(
+	maxConns int, tc config.Transport, proxy func(*http.Request) (*url.URL, error),
+	onH2Err H2ErrorReporter,
+) *http.Transport {
 	if maxConns <= 0 {
 		maxConns = 1024
 	}
-	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	d := newDialer(tc)
 
 	t := &http.Transport{
-		Proxy:                 proxy,
-		DialContext:           d.DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          maxConns * 4,
-		MaxIdleConnsPerHost:   maxConns,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		Proxy:               proxy,
+		DialContext:         d.DialContext,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        maxConns * 4,
+		MaxIdleConnsPerHost: maxConns,
+		// 0 = 不限制。主要约束 HTTP/1.1 通道，h2 下连接数由流并发上限决定。
+		MaxConnsPerHost:       tc.MaxConnsPerHost,
+		IdleConnTimeout:       orDur(tc.IdleConnTimeout, defIdleConnTimeout),
+		TLSHandshakeTimeout:   orDur(tc.TLSHandshakeTimeout, defTLSHandshakeTimeout),
 		ExpectContinueTimeout: time.Second,
 		DisableCompression:    true,
-		WriteBufferSize:       64 << 10,
-		ReadBufferSize:        64 << 10,
+		WriteBufferSize:       orInt(tc.WriteBufferSize, defBufSize),
+		ReadBufferSize:        orInt(tc.ReadBufferSize, defBufSize),
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 	}
-	if h2, err := http2.ConfigureTransports(t); err == nil && h2 != nil {
-		h2.ReadIdleTimeout = 30 * time.Second
-		h2.PingTimeout = 15 * time.Second
-	}
+	// h2 健康检查。取值必须排在应用层看门狗之后，理由见
+	// config.Transport.H2IdleTimeout：PING 无应答时关掉的是**整条**连接，
+	// 其上所有复用中的流会一起失败。默认值由 config.normalizeTransport
+	// 依非流式首字节预算推导。
+	applyH2HealthCheck(t, tc, onH2Err)
 	return t
+}
+
+// newDialer 按配置构建拨号器。
+//
+// 单独成函数是为了可测：*http.Transport 不保留 Dialer，
+// Timeout 与 KeepAlive 两个值配完之后读不回来，只有把构造这一步
+// 暴露出来，测试才能断言它们真的被写进去了。
+func newDialer(tc config.Transport) *net.Dialer {
+	return &net.Dialer{
+		Timeout:   orDur(tc.DialTimeout, defDialTimeout),
+		KeepAlive: orDur(tc.KeepAlive, defKeepAlive),
+	}
+}
+
+// applyH2HealthCheck 把 h2 健康检查参数与连接级事件出口写到 transport 上。
+//
+// 单独成函数是为了**可测**：这几个值无法从 *http.Transport 读回
+// （ConfigureTransports 的返回值才是唯一句柄），只有把赋值这一步暴露出来，
+// 测试才能断言「配置真的生效了」。否则这类参数「改了没效果」
+// 在单测里完全不可见 —— 而这正是本次把它们配置化的起因。
+//
+// x/net/http2 的语义是 ReadIdleTimeout == 0 即关闭 PING，因此配置里的 0
+// 直接落到「不启用」。返回 nil 表示 h2 未配置成功（连接按 HTTP/1.1 处理）。
+//
+// onH2Err 无条件接上（即使 PING 被关掉）：CountError 报的不只是 PING 失败，
+// 还有 GOAWAY 与读帧错误，那几类与健康检查开关无关。
+func applyH2HealthCheck(t *http.Transport, tc config.Transport, onH2Err H2ErrorReporter) *http2.Transport {
+	h2, err := http2.ConfigureTransports(t)
+	if err != nil || h2 == nil {
+		return nil
+	}
+	h2.ReadIdleTimeout = tc.H2IdleTimeout
+	h2.PingTimeout = orDur(tc.H2PingTimeout, defH2PingTimeout)
+	// x/net/http2 在**每次建连**时读这个字段（newClientConn），所以在此赋值
+	// 即可覆盖此后建立的所有连接，无需在建连路径上再做手脚。
+	h2.CountError = onH2Err
+	return h2
 }
 
 // Client 包装 http.Client，提供带首字节与空闲超时的请求执行。
@@ -299,6 +375,17 @@ func (c *Client) describe(err error, req *http.Request, start time.Time, total t
 }
 
 func orDur(v, def time.Duration) time.Duration {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// orInt 是或运算的整数版：0 视为「未配置」。
+//
+// 只用于缓冲这类 0 无独立语义的参数；MaxConnsPerHost 那种
+// 「0 = 不限制」的取值不能过这里，否则会被替换成默认值。
+func orInt(v, def int) int {
 	if v <= 0 {
 		return def
 	}

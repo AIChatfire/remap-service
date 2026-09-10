@@ -616,6 +616,9 @@ chunk 被 `MayMatch` 剪枝，连 JSON 都不用解析。
 - **通配规则在构建期编译并按具体度预排序**，查询时只做匹配；精确规则仍走 map，不受通配规则数量影响
 - `X-Model-Map` 解析结果分片缓存，Header 取值基数等于渠道数
 - `GOGC=300`（可用环境变量覆盖）—— 网关是短生命周期对象密集型负载
+- `GOMEMLIMIT` 由容器内存上限推导（80%，见 `internal/memlimit`），可在启动日志
+  的 `gomemlimit` 字段核对 —— `GOGC` 决定「平时多懒」，它决定「最坏能到多少」，
+  只设前者会在上游变慢时一路涨到 OOM-kill
 
 连接复用：640 个请求（并发 32）只用 28 条上游连接，有测试断言。
 
@@ -742,7 +745,10 @@ gateway_requests_inflight
    而不是继续调网关。**判断超时归属先看 `gateway.upstream.wrote_request_ms`** ——
    它接近超时上限说明请求压根没发出去（本地排队），只有几毫秒说明时间全花在等上游。
 3. **不设 WriteTimeout** —— 流式响应可持续数分钟，写超时会误杀长连接。
-4. **优雅退出** —— 收到 SIGTERM 后 `/readyz` 先转 503 让 LB 摘流量，再关闭连接。
+4. **优雅退出** —— 收到 SIGTERM 后 `/readyz` 先转 503，等 `SHUTDOWN_DRAIN_DELAY`
+   （默认 5s，覆盖 LB 健康检查间隔）再放完在途请求，最后 flush 一次遥测。
+   三段之和必须小于 compose 的 `stop_grace_period`，否则最后一段会被 SIGKILL
+   掐掉；进程把总和打在启动日志的 `shutdown_budget_total`，据此核对。
 5. **别名库维护** —— 上游发布新版本号时及时登记，否则脱敏会残留。
 6. **`MAX_SANITIZE_BYTES` 触发即 400** —— span 的 `gateway.error.kind` 为
    `response_too_large`。持续出现说明有客户端在请求超大响应（多见于没限制
@@ -765,7 +771,7 @@ gateway_requests_inflight
 | 静态检查 | gofmt、`go vet`、`go mod tidy` 无残留、staticcheck、actionlint |
 | 测试 | `go test -race` on Linux + macOS，Linux 侧另出覆盖率 |
 | 端到端 | `make e2e`，本地 mock 上游，不需要任何密钥 |
-| 镜像 | 构建镜像 + `-version`/`-check` 冒烟 + compose 语法校验 |
+| 镜像 | 构建镜像 + `-version`/`-check` 冒烟 + 起服务自探 `/healthz` + compose 语法校验 |
 
 Go 版本统一由 `go-version-file: go.mod` 决定，升级 `go.mod` 即全局生效 ——
 Dockerfile 里的 `golang:1.25-alpine` 需要同步手改，两者不一致会直接构建失败。
