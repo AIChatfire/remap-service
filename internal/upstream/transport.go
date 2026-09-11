@@ -57,10 +57,14 @@ func NewTransport(maxConns int) *http.Transport {
 // HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量。
 //
 // onH2Err 接收 h2 连接级事件（见 H2ErrorReporter），可为 nil。
+// onProxyEvict 接收 per-request 代理池的淘汰事件（见 ProxyEvictReporter），可为 nil。
 //
 // 返回值同时满足 http.RoundTripper 与 CloseIdleConnections，
 // 可直接交给 NewClient 并在退出时清理。
-func NewRoundTripper(maxConns int, tc config.Transport, u config.Upstream, onH2Err H2ErrorReporter) *Router {
+func NewRoundTripper(
+	maxConns int, tc config.Transport, u config.Upstream,
+	onH2Err H2ErrorReporter, onProxyEvict ProxyEvictReporter,
+) *Router {
 	proxy := http.ProxyFromEnvironment
 	if p := strings.TrimSpace(u.Proxy); p != "" {
 		// 已在 config.Validate 校验过，这里解析失败只可能是被绕过配置层，
@@ -69,7 +73,8 @@ func NewRoundTripper(maxConns int, tc config.Transport, u config.Upstream, onH2E
 			proxy = proxyWithBypass(pu, u.NoProxy)
 		}
 	}
-	return NewRouter(newTransport(maxConns, tc, proxy, onH2Err), maxConns, tc, u.NoProxy, onH2Err)
+	return NewRouter(newTransport(maxConns, tc, proxy, onH2Err), maxConns, tc, u.NoProxy,
+		u.MaxProxyTransports, onH2Err, onProxyEvict)
 }
 
 // 内置默认值：与这些参数被暴露为配置项之前的行为保持一致。

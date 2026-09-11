@@ -2,11 +2,14 @@ package upstream
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/betterme/remap-service/internal/config"
 )
@@ -24,7 +27,13 @@ func (c *countingRT) RoundTrip(*http.Request) (*http.Response, error) {
 
 func newRouterFixture() (*Router, *countingRT) {
 	def := &countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}
-	return NewRouter(def, 0, config.Transport{}, "", nil), def
+	return NewRouter(def, 0, config.Transport{}, "", 0, nil, nil), def
+}
+
+// newPoolRouter 造一个带池上限与淘汰回调的 Router（容量类测试用）。
+func newPoolRouter(limit int, onEvict ProxyEvictReporter) *Router {
+	def := &countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}
+	return NewRouter(def, 0, config.Transport{}, "", limit, nil, onEvict)
 }
 
 // 未声明代理时必须原样走默认出口。
@@ -119,7 +128,7 @@ func TestRouterRoutesThroughProxy(t *testing.T) {
 	}))
 	defer px.Close()
 
-	r := NewRouter(&countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}, 0, config.Transport{}, "", nil)
+	r := NewRouter(&countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}}, 0, config.Transport{}, "", 0, nil, nil)
 	defer r.CloseIdleConnections()
 
 	// 目标是一个不存在的地址，只有真的过了代理才可能成功。
@@ -185,7 +194,7 @@ func TestRouterPerRequestProxyHonorsNoProxy(t *testing.T) {
 
 	// 代理指向一个不可达地址：只有真的绕过代理直连 origin 才可能成功。
 	r := NewRouter(&countingRT{resp: &http.Response{StatusCode: 204, Body: http.NoBody}},
-		0, config.Transport{}, "127.0.0.1", nil)
+		0, config.Transport{}, "127.0.0.1", 0, nil, nil)
 	defer r.CloseIdleConnections()
 
 	req, _ := http.NewRequest(http.MethodGet, origin.URL+"/v1/models", nil)
@@ -198,6 +207,123 @@ func TestRouterPerRequestProxyHonorsNoProxy(t *testing.T) {
 	resp.Body.Close()
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("origin 命中次数 = %d, 期望 1", got)
+	}
+}
+
+// 池满时必须淘汰最久未使用的那个，最近用过的要留下。
+//
+// 这是近似 LRU 的核心契约：淘汰 lastUsed 最小的条目。
+func TestRouterEvictsLeastRecentlyUsed(t *testing.T) {
+	var evicted []int
+	r := newPoolRouter(2, func(size, limit int) { evicted = append(evicted, size) })
+
+	a, err := r.transportFor("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 时间戳精度虽是纳秒，但同一毫秒内的连续调用仍可能取到相同值，
+	// 这里显式拉开间隔，让「最久未用」是确定的。
+	time.Sleep(2 * time.Millisecond)
+	if _, err := r.transportFor("http://127.0.0.1:2"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	// 重新使用 a，使它成为最近使用过的那个
+	if _, err := r.transportFor("http://127.0.0.1:1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	// 池已满，第三个代理应挤掉最久未用的 b
+	if _, err := r.transportFor("http://127.0.0.1:3"); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := poolSize(r); n != 2 {
+		t.Fatalf("池大小 = %d，应为上限 2", n)
+	}
+	if len(evicted) != 1 {
+		t.Fatalf("淘汰回调被调用 %d 次，应为 1", len(evicted))
+	}
+	again, err := r.transportFor("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != a {
+		t.Error("最近使用过的代理被淘汰了，淘汰策略不是 LRU")
+	}
+}
+
+// 并发灌入远超上限的代理时，池大小不得越过上限，且必须触发淘汰。
+func TestRouterPoolRespectsLimitUnderConcurrency(t *testing.T) {
+	const limit = 8
+	var evictions atomic.Int64
+	r := newPoolRouter(limit, func(int, int) { evictions.Add(1) })
+
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := r.transportFor(fmt.Sprintf("http://127.0.0.1:%d", i+1)); err != nil {
+				t.Errorf("代理 %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if got := poolSize(r); got > limit {
+		t.Errorf("池大小 %d 越过上限 %d", got, limit)
+	}
+	if evictions.Load() == 0 {
+		t.Error("建了 200 个代理却没有触发任何淘汰")
+	}
+}
+
+// 淘汰必须同时关掉该 transport 的空闲连接。
+//
+// 不关的话，淘汰只是把「transport 对象常驻」换成「连接 + fd 常驻」——
+// 泄漏换了个形态，问题并没有解决。
+func TestRouterEvictionClosesIdleConnections(t *testing.T) {
+	var closed atomic.Int64
+	// 把测试服务器当作「客户端指定的代理」：请求经由它发出，
+	// 请求结束后该 transport 上就会留下一条空闲连接。
+	px := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(204)
+	}))
+	px.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			closed.Add(1)
+		}
+	}
+	px.Start()
+	defer px.Close()
+
+	r := newPoolRouter(1, nil)
+	defer r.CloseIdleConnections()
+
+	rt, err := r.transportFor(px.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://upstream.invalid/v1/models", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("经代理请求失败: %v", err)
+	}
+	resp.Body.Close()
+
+	// 再换一个代理把池挤满 → 上面那个 transport 被淘汰，空闲连接应被关闭。
+	if _, err := r.transportFor("http://127.0.0.1:9"); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for closed.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if closed.Load() == 0 {
+		t.Error("淘汰未关闭该 transport 的空闲连接")
 	}
 }
 

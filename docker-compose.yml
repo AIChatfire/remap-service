@@ -79,8 +79,11 @@ services:
     #
     # 取值说明：65536 相对本机默认的 1048576 是一次**收紧**，这是有意的 ——
     # 目标是「一个确定的、跨环境一致的上限」，而非「尽可能大」。它足以覆盖
-    # 最坏情形：h2 不可用回落 HTTP/1.1 时连接数 ≈ MAX_INFLIGHT(10240)，
+    # 最坏情形：h2 不可用回落 HTTP/1.1 时连接数 ≈ MAX_INFLIGHT，
     # 再加每个 per-request 代理各自的一份池。
+    # ⚠️ 这里**刻意不写死具体数字**，取值见 .env.example 的 MAX_INFLIGHT ——
+    #    该数字曾在 .env.example / internal/config/config.go / 本文件之间
+    #    出现三个不同的值（1024 / 4096 / 10240），写死必然会再次漂移。
     # 若压测出现 EMFILE（open ...: too many open files），
     # 应连同 MAX_INFLIGHT / MAX_CONNS 一起评估，而不是单独抬这个数。
     # ⚠️ 硬限制不得超过 dockerd 自身，否则容器直接起不来 ——

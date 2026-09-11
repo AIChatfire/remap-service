@@ -38,6 +38,13 @@ type Metrics struct {
 	// **所有**在途流一起失败，于是它成了请求级错误的放大器 ——
 	// 两者一起看才能分清「挂了一个请求」与「挂了一条连接、连带几十个请求」。
 	H2ConnErrors metric.Int64Counter
+	// ProxyTransportsEvicted 是 per-request 代理池因超出上限而淘汰 transport
+	// 的次数。
+	//
+	// 持续非零说明两件事之一：上限过小，或客户端在大量使用不同代理。
+	// 两者都需要运维介入，且都不是任何请求级指标能反映的 —— 淘汰发生在池上，
+	// 是「某个代理被挤出容量」，与单条请求的结果无关。
+	ProxyTransportsEvicted metric.Int64Counter
 	// SanitizeSuppressed 是「上游标识确实出现在响应里、但一次都没被替换」的
 	// 计数 —— 唯一的静默漏点。
 	//
@@ -108,6 +115,9 @@ func newMetrics(m metric.Meter) (*Metrics, error) {
 	pick(e)
 	out.H2ConnErrors, e = m.Int64Counter("gateway.upstream.h2_conn_errors",
 		metric.WithDescription("h2 传输层连接级事件数（PING 探活失败、GOAWAY、读帧错误等）"))
+	pick(e)
+	out.ProxyTransportsEvicted, e = m.Int64Counter("gateway.upstream.proxy_transports_evicted",
+		metric.WithDescription("per-request 代理池超出上限而淘汰 transport 的次数"))
 	pick(e)
 	out.SanitizeSuppressed, e = m.Int64Counter("gateway.sanitize.suppressed",
 		metric.WithDescription("响应里出现上游标识但零替换的次数（长度阈值放行的静默漏点）"))

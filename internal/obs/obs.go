@@ -155,6 +155,31 @@ func (p *Provider) CountH2Error(kind string) {
 		metric.WithAttributes(attribute.String("kind", kind)))
 }
 
+// CountProxyTransportEviction 记录一次 per-request 代理池的淘汰。
+//
+// 与 CountH2Error 同理，它不是请求级事件：淘汰发生在池上，触发条件是
+// 「某个代理被挤出容量」，而非任何单条请求的结果，写进某个请求的 span
+// 等于随机归因。
+//
+// 除了指标还打一条 warn 日志，是因为计数本身说不清规模 ——「累计淘汰了 3 次」
+// 与「池长期贴着上限、每来一个新代理就淘汰一个」是完全不同的运维结论，
+// 而后者只能从池水位看出来。limit 一并进日志，便于与配置核对。
+//
+// 由 upstream 层以回调形式注入（见 upstream.ProxyEvictReporter）。
+func (p *Provider) CountProxyTransportEviction(size, limit int) {
+	if p == nil {
+		return
+	}
+	if p.Metrics != nil {
+		Add(context.Background(), p.Metrics.ProxyTransportsEvicted, 1)
+	}
+	if p.Logger != nil {
+		p.Logger.Warn("per-request 代理池已满，淘汰最久未使用的出口",
+			slog.Int("proxy_pool_size", size),
+			slog.Int("proxy_pool_limit", limit))
+	}
+}
+
 // New 依据配置初始化可观测性。返回的 Provider 永远非 nil。
 func New(ctx context.Context, c config.Obs) (*Provider, error) {
 	p := &Provider{

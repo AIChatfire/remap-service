@@ -108,6 +108,20 @@ type Upstream struct {
 	// AllowProxyHeader 控制是否接受 X-Upstream-Proxy 覆盖本次请求的代理。
 	// 默认关闭：开启后客户端可指定任意出网地址，属于把网关当跳板的能力。
 	AllowProxyHeader bool
+	// MaxProxyTransports 是 per-request 代理池的容量上限，池满时淘汰最久未用的。
+	//
+	// 这一项存在的原因是 AllowProxyHeader 否掉了「代理数量由运维侧决定」这个
+	// 前提：开启后代理数量变成「客户端能声明多少就有多少」，而池内 transport
+	// 是常驻的。没有上限就意味着客户端用 N 个不同代理各发一次请求，就能让
+	// N 个 transport 永久留在内存里。
+	//
+	// 淘汰只在池满时发生、且只挑最久未用的那一个，所以正常场景（代理数个位数）
+	// 永远走不到这条路径，连接池的复用不受影响。
+	//
+	// 取值与 upstream.defaultProxyPoolLimit 必须一致：配置加载路径一定会填上
+	// 这个值，那边的常量只服务手工构造的 Router（测试、零配置入口）。
+	// 启动日志的 max_proxy_transports 可用于核对两者是否漂移。
+	MaxProxyTransports int
 	// NoProxy 是不走代理的主机列表，语义同标准 NO_PROXY。
 	//
 	// 显式配 Proxy 时走 http.ProxyURL，它没有 ProxyFromEnvironment
@@ -329,10 +343,12 @@ func Load(envFile string) (*Config, error) {
 			AllowBaseHeader:  envBool("UPSTREAM_BASE_FROM_HEADER", true),
 			Proxy:            strings.TrimSpace(envStr("UPSTREAM_PROXY", "")),
 			AllowProxyHeader: envBool("UPSTREAM_PROXY_FROM_HEADER", false),
-			NoProxy:          strings.TrimSpace(envStr("UPSTREAM_NO_PROXY", "localhost,127.0.0.1,::1")),
-			Timeout:          envDur("UPSTREAM_TIMEOUT", 600*time.Second),
-			StreamTimeout:    envDur("UPSTREAM_STREAM_TIMEOUT", 30*time.Minute),
-			FirstByteTimeout: envDur("UPSTREAM_FIRST_BYTE_TIMEOUT", 30*time.Second),
+			// 默认值须与 upstream.defaultProxyPoolLimit 一致，理由见字段注释。
+			MaxProxyTransports: envInt("UPSTREAM_MAX_PROXY_TRANSPORTS", 64),
+			NoProxy:            strings.TrimSpace(envStr("UPSTREAM_NO_PROXY", "localhost,127.0.0.1,::1")),
+			Timeout:            envDur("UPSTREAM_TIMEOUT", 600*time.Second),
+			StreamTimeout:      envDur("UPSTREAM_STREAM_TIMEOUT", 30*time.Minute),
+			FirstByteTimeout:   envDur("UPSTREAM_FIRST_BYTE_TIMEOUT", 30*time.Second),
 			// 非流式的响应头要等整段生成跑完，必须比流式那个宽松一个量级。
 			FirstByteTimeoutNonStream: envDur("UPSTREAM_FIRST_BYTE_TIMEOUT_NONSTREAM", 300*time.Second),
 			// 默认 0 = 关闭。envDur 对 0 与未设置同样返回默认值，
@@ -554,6 +570,7 @@ func (c *Config) Summary() []any {
 		// 会让人以为客户端能决定出网路径，把排查方向整个带偏。
 		"upstream_proxy", orNoProxy(c.Upstream.Proxy),
 		"proxy_from_header", c.Upstream.AllowProxyHeader,
+		"max_proxy_transports", c.Upstream.MaxProxyTransports,
 		// 超时值全部进启动日志：这几个键此前只能靠「行为不像预期」反推，
 		// 而改错了键名不会有任何报错。
 		"timeout", c.Upstream.Timeout.String(),

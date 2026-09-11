@@ -216,7 +216,10 @@ func run(envFile string, checkOnly bool) error {
 	// o.CountH2Error 把 h2 的连接级事件（最要紧的是 conn_close_lost_ping）
 	// 接进指标。这类事件不属于任何单个请求，端口留在 upstream 层、
 	// 由这里注入，避免 upstream 反向依赖 obs。
-	tr := upstream.NewRoundTripper(cfg.Limits.MaxConns, cfg.Transport, cfg.Upstream, o.CountH2Error)
+	// o.CountProxyTransportEviction 同理由此注入：per-request 代理池的淘汰
+	// 同样不属于任何单个请求，且是「上限是否过小」的唯一直接证据。
+	tr := upstream.NewRoundTripper(cfg.Limits.MaxConns, cfg.Transport, cfg.Upstream,
+		o.CountH2Error, o.CountProxyTransportEviction)
 	defer tr.CloseIdleConnections()
 
 	gw := gateway.New(cfg, upstream.NewClient(tr, cfg.Upstream), o)
