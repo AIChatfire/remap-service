@@ -447,6 +447,78 @@ timeout ≈ 分位数(成功耗时, 0.99) × 1.5 ~ 2
 分位数只能基于**成功**请求统计。把超时请求算进去会让分布被当前阈值截断，
 下一轮算出更小的值，逐次收紧成死循环。
 
+### 首字提前下发（`STREAM_EARLY_FIRST_EVENT`，默认关闭）
+
+拿到上游流式响应头（2xx + `text/event-stream`）的那一刻，先给客户端下发一个
+**内容为空**的首事件，再开始透传上游的真实事件。
+
+**它解决什么**：上游「返回响应头」与「吐出第一个 token」之间隔着整段 prefill。
+这段时间流已经建立，客户端却收不到任何事件 —— 凡是以「收到第一个 SSE 事件」
+为口径的首字 / TTFT，都把这段 prefill 算进了模型响应时间。
+
+**它改的是指标口径，不是数据**：
+
+| 维度 | 是否改变 |
+| --- | --- |
+| 不变 | 生成的内容、token 数、总时长；发给上游的请求一字不变 |
+| 变了 | 下游观测到的首字不再等于「上游生成第一个 token 的时刻」，而等于「上游返回响应头的时刻」。两者之差就是整段 prefill |
+
+对把 role 前置事件当协议常态的上游（OpenAI 系），两者本就接近；对把首事件压在
+prefill 之后的上游，这个数字会被显著改善 —— 但它衡量的东西确实变了。所以默认
+关闭：打开它等于同意下游的「首字」不再代表模型的真实 TTFT。
+
+生效范围按**入站路由**登记，而不是按协议名 —— 同一个协议下不同端点的流形态并
+不相同：
+
+| 路由 | 下发的首事件 |
+| --- | --- |
+| `/v1/chat/completions` | `delta.content` 为空的 `chat.completion.chunk`。刻意不带 `role`：上游自己通常会发一个 role 前置事件，补第二个会让「以 `delta.role` 为新消息起点」的客户端多起一条消息 |
+| `/v1/messages` | Anthropic 官方的 `ping` 事件。各家 SDK 都显式忽略它，且不会与上游随后发出的真实 `message_start` 冲突 |
+| 其余（`/v1/responses`、`/v1/completions` …） | **不下发**。前者的事件带单调递增的 `sequence_number` 与完整 `response` 对象，伪造会被严格客户端判成序列错乱；后者是 `text_completion` 形态，套用 chat 的会给出客户端解析不了的事件 |
+
+**合成事件与上游正文走同一条脱敏路径。** 它是本进程构造的、天然不经过 SSE 转发
+管道，因此是整条流里唯一一段「本进程构造、却能写进客户端响应」的字节。所以它不做
+旁路替换，而是交给 `protocol.SanitizeEvent` 逐行处理 —— 与上游字节用的是同一个
+`transformLine`：`model` 字段被 Spec 的 `ModelPaths` 规则整体覆盖为对外名，其余字段
+里的上游标识由同一把替换器擦掉。**泄漏面因此是结构上不成立，而不是靠一条断言盯着
+某个字段。** 两道防线各自独立：脱敏开启时管道兜底（把 `model` 写成上游名也不会泄
+漏）；脱敏关闭时退回调用点约定，由断言守住。
+
+**实测结论：第一个事件不能只发 `data: `。** 下游（如 new-api 的流扫描器
+`relay/helper/stream_scanner.go`）判定首字的条件等价于：
+
+```go
+len(line) >= 6 && line[:5] == "data:" &&
+    strings.TrimSpace(line[5:]) != "" &&
+    !strings.HasPrefix(trimmed, "[DONE]")
+```
+
+于是**空载荷与纯空白载荷都被静默跳过** —— 「第一个事件用空字符串或空格」这条
+路子做了也不会有任何效果，而且不会有任何报错指向它。能生效的只有「载荷是合法
+JSON、而其中的 `content` 为空」。这也是它与 SSE 注释心跳的分界：`: PING` 同样
+被跳过、刻意不计入首字（new-api 自己的心跳就是这个形态）。
+
+**下发份数固定为 2 份**（`protocol.PreambleCopies`），这是实测逼出来的，不是笔误。
+下游逐块转发时普遍是「收到第 N 块才下发第 N-1 块」—— new-api 的 `OaiStreamHandler`
+就把上一块存在 `lastStreamData` 里、等下一块到了才写出去。只发一份，这一份会被
+压在那里直到真实 token 到达：
+
+| 份数 | new-api 记录的首字 | 终端用户首字节 |
+| --- | --- | --- |
+| 0 | 1.5s | 1.5s |
+| 1 | **0s** | **1.5s** ← 指标好看了，用户端一点没变 |
+| 2 | **0s** | **0s** |
+
+上表是用 new-api 的真实代码（`relay/helper.StreamScannerHandler`）+ 上游 prefill
+1.5s 实测的。第二行是本功能最容易踩的坑：只改指标、不改体验。取 2 而不是做成
+可配置项，是因为它与下游的具体实现无关 —— 对方哪天改成立即转发，两份仍然正确。
+
+注入每次都留痕，可据此把合成事件从首字统计里剔掉：
+
+- 指标 `gateway_stream_preamble_total`
+- span 属性 `gateway.stream.preamble`（布尔）与 `gateway.stream.preamble_bytes`
+- 日志字段 `preamble` / `preamble_bytes`（只在真的注入时才出现）
+
 ### 出网代理
 
 支持 `http` / `https` / `socks5` / `socks5h` 四种 scheme，均由标准库处理，
@@ -559,6 +631,7 @@ LOGFIRE_REGION=us              # us | eu，须与 token 所属区域一致
 | `gateway.attempt.count` | 失败尝试次数。恒写，`0` 表示本次没有失败尝试 |
 | `gateway.credential.fingerprint` | 凭据的 8 位哈希前缀，用于按渠道聚合（上游限流按账号计） |
 | `gateway.request.id` | 客户端传入的 `X-Request-Id`。超时拿不到上游 logid，这是跨系统串联的唯一把手 |
+| `gateway.stream.preamble` / `.preamble_bytes` | 本次流式响应是否在开头合成下发了一个空首事件、以及它的字节数。**打开 `STREAM_EARLY_FIRST_EVENT` 后，「首字变快」与「上游真的变快」在曲线上完全同形**，只能靠这个属性区分 |
 
 两点约定：`gateway.request.id` 只在客户端提供了才写（网关自己生成的 ID 客户端
 并不知道，串不起任何东西）；`gateway.credential.fingerprint` 只落哈希前缀，
@@ -572,7 +645,7 @@ gateway_upstream_ttfb_milliseconds  gateway_requests_inflight
 gateway_upstream_errors_total       gateway_sse_events_total
 gateway_bytes_in_total              gateway_bytes_out_total
 gateway_sanitize_rewrites_total     gateway_requests_rejected_total
-gateway_model_failover_total
+gateway_model_failover_total        gateway_stream_preamble_total
 ```
 
 > 指标与 trace 中的 `model` 恒为**对外模型名**。真实上游模型只出现在内部结构化日志的

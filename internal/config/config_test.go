@@ -346,6 +346,39 @@ MAX_BODY_BYTES=32MB
 	}
 }
 
+// 首事件提前下发默认关闭。
+//
+// 它改的是下游「首字」这个数字的含义（从「上游吐出第一个 token」变成
+// 「上游返回响应头」），不该因为拉了个新镜像就被悄悄打开。
+func TestStreamEarlyFirstEventDefaultsOff(t *testing.T) {
+	isolate(t)
+	t.Setenv("UPSTREAM_BASE", "https://x.com")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Stream.EarlyFirstEvent {
+		t.Error("未配置 STREAM_EARLY_FIRST_EVENT 时必须为 false")
+	}
+}
+
+// 键名拼错不会有任何报错，只会静默沿用默认值 —— 表现正是「开了却没效果，
+// 而且不知道是没开还是没生效」。这个用例把键名与装配路径一起钉住。
+func TestStreamEarlyFirstEventFromEnv(t *testing.T) {
+	isolate(t)
+	p := writeEnv(t, `
+UPSTREAM_BASE=https://x.com
+STREAM_EARLY_FIRST_EVENT=true
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Stream.EarlyFirstEvent {
+		t.Error("STREAM_EARLY_FIRST_EVENT=true 未生效：键名或装配路径对不上")
+	}
+}
+
 // 给了 token 却忘开 OBS_ENABLED 是最常见失误，应自动启用。
 func TestObsEnabledInferred(t *testing.T) {
 	t.Run("有 token 自动启用", func(t *testing.T) {

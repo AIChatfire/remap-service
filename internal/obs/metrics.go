@@ -19,9 +19,17 @@ type Metrics struct {
 	InFlight    metric.Int64UpDownCounter
 	UpstreamErr metric.Int64Counter
 	SSEEvents   metric.Int64Counter
-	BytesIn     metric.Int64Counter
-	BytesOut    metric.Int64Counter
-	Rewrites    metric.Int64Counter
+	// StreamPreamble 是「网关在流式响应开头合成并下发了一个空首事件」的次数
+	// （STREAM_EARLY_FIRST_EVENT 打开时）。
+	//
+	// 为什么必须可数：这个事件不是上游发的，它把下游按首个 SSE 事件计的
+	// 首字/TTFT 提前到了「上游返回响应头」的时刻。缺少这个计数，看板上的
+	// 首字改善就无法与「上游真的变快了」区分开 —— 两者在曲线上完全同形。
+	// 有了它，任何首字统计都能用「事件总数 − 本计数」衡量真实生成起的部分。
+	StreamPreamble metric.Int64Counter
+	BytesIn        metric.Int64Counter
+	BytesOut       metric.Int64Counter
+	Rewrites       metric.Int64Counter
 	// Rejected 是被并发闸门拒绝的请求数。这个指标持续非零
 	// 说明容量不足或上游变慢，应当扩容或调高 MAX_INFLIGHT。
 	Rejected metric.Int64Counter
@@ -97,6 +105,9 @@ func newMetrics(m metric.Meter) (*Metrics, error) {
 	pick(e)
 	out.SSEEvents, e = m.Int64Counter("gateway.sse.events",
 		metric.WithDescription("转发的 SSE 事件数"))
+	pick(e)
+	out.StreamPreamble, e = m.Int64Counter("gateway.stream.preamble",
+		metric.WithDescription("流式响应开头合成下发空首事件的次数（会使下游首字早于真实首 token）"))
 	pick(e)
 	out.BytesIn, e = m.Int64Counter("gateway.bytes.in",
 		metric.WithDescription("请求体字节数"), metric.WithUnit("By"))

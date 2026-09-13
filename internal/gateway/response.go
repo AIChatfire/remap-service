@@ -48,14 +48,47 @@ func (g *Gateway) pipeStream(
 	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(resp.StatusCode)
 
-	fl, _ := w.(http.Flusher)
-	if fl != nil {
-		fl.Flush() // 立刻把响应头推给客户端，缩短感知首包时间。
-	}
-
+	// 与正文共用同一个 transformer：合成事件必须走**同一条**脱敏路径，
+	// 而不是一条长得像的旁路。见下面 protocol.SanitizeEvent 处的说明。
 	var tr protocol.Transformer
 	if g.cfg.SanitizeEnabled() && st.publicModel != "" {
 		tr = transformer{spec: spec, rep: rep, public: st.publicModel}
+	}
+
+	// 首事件提前下发。响应头已到 = 上游接受了这次请求，但真实的首个 token
+	// 还要等整段 prefill；这段时间里流虽已建立，客户端却收不到任何事件，
+	// 所有「以首个 SSE 事件为口径」的首字统计都会把 prefill 算进去。
+	// 先合成一个内容为空、协议合法的首事件，把这段等待变成「流已开始」。
+	//
+	// ⚠️ 合成事件必须过 tr。它不是上游来的，天然不经过 PipeSSE，因此是整条流
+	// 里唯一一段「本进程构造、却能原样写进客户端响应」的字节 —— 这是本功能
+	// 唯一的泄漏面。只加一条「里面必须是对外名」的断言不够：断言只能证明当前
+	// 那行代码写对了，挡不住后续任何改动（改错字段、或将来往事件里补了上游的
+	// id / system_fingerprint）。走同一条路径之后，model 字段会被 Spec 的
+	// ModelPaths 规则**整体覆盖**为对外名，合成事件的 model 与正文的必然一致；
+	// 其余字段里的上游标识也会被同一把替换器擦掉。泄漏面由此从「约定」变成
+	// 「结构上不成立」。
+	//
+	// 连写 PreambleCopies 份：下游逐块转发时会延迟一块（收到第 N 块才发
+	// 第 N-1 块），只发一份的话提前量会被那一块的延迟吃掉。原因与实测数字
+	// 见 protocol.PreambleCopies 的注释。
+	//
+	// 写在 flush 之前是有意的：合并成一次 flush，不多付 syscall。
+	// 未启用、或该路由没有安全形态时 len(pre)==0，行为与从前逐字节一致。
+	if pre := protocol.SanitizeEvent(g.earlyFirstEvent(st), tr); len(pre) > 0 {
+		for i := 0; i < protocol.PreambleCopies; i++ {
+			n, werr := w.Write(pre)
+			st.preambleBytes += n
+			if werr != nil {
+				break
+			}
+		}
+		st.preamble = st.preambleBytes > 0
+	}
+
+	fl, _ := w.(http.Flusher)
+	if fl != nil {
+		fl.Flush() // 立刻把响应头（以及上面那个合成首事件）推给客户端。
 	}
 
 	// 空闲超时：响应头已到、流已建立，但上游中途不再吐数据。
@@ -76,18 +109,34 @@ func (g *Gateway) pipeStream(
 	st.sseEvents = stats.Events
 	st.bytesOut = stats.Bytes
 	st.rewrites = stats.Rewrote
+	// 合成首事件确实写到了客户端，字节要计入 out_bytes / bytes.out ——
+	// 那两个口径是「下行体积」，少算就等于出口流量与日志对不上。
+	// sse_events 保持「上游转发的事件数」不变，合成事件由
+	// gateway.stream.preamble 单独计数：两个信号各自可数，「有多少事件
+	// 是合成的」才回答得了。
+	if st.preamble {
+		st.bytesOut += int64(st.preambleBytes)
+	}
 
 	a := st.metricAttrs("stream", resp.StatusCode)
 	obs.Add(ctx, st.mx.SSEEvents, stats.Events, a)
-	obs.Add(ctx, st.mx.BytesOut, stats.Bytes, a)
+	obs.Add(ctx, st.mx.BytesOut, st.bytesOut, a)
 	obs.Add(ctx, st.mx.Rewrites, stats.Rewrote, a)
 	// 抑制信号与改写数并列上报：单看任何一个都分不清「响应里根本没出现
 	// 上游标识」与「出现了但全被长度阈值放行」。后者是唯一的静默漏点。
 	obs.Add(ctx, st.mx.SanitizeSuppressed, stats.Suppressed, a)
+	if st.preamble {
+		obs.Add(ctx, st.mx.StreamPreamble, 1, a)
+	}
 	span.SetAttributes(
 		attribute.Int64("gateway.sse.events", stats.Events),
 		attribute.Int64("gateway.sse.bytes", stats.Bytes),
 		attribute.Int64("gateway.sanitize.suppressed", stats.Suppressed),
+		// 合成首事件必须单独留痕、且与 sse.events/bytes 并列：缺了它，
+		// 「首字变快」与「上游真的变快」在 trace 列表与曲线上完全同形，
+		// 而这正是打开 STREAM_EARLY_FIRST_EVENT 后最容易被误读的地方。
+		attribute.Bool("gateway.stream.preamble", st.preamble),
+		attribute.Int("gateway.stream.preamble_bytes", st.preambleBytes),
 	)
 
 	if err != nil {
@@ -129,6 +178,20 @@ func (g *Gateway) pipeStream(
 		}
 	}
 	return resp.StatusCode
+}
+
+// earlyFirstEvent 返回本次流式响应最前面要合成的首事件，未启用时返回 nil。
+//
+// 判据只认 st.route —— 由**入站**路径派生的低基数标签。协议形态取决于
+// 入站路径，与上游实际拼出来的路径无关：上游前缀会被 buildURL 剥掉
+// （base=https://ark…/api/v3 + /v1/chat/completions →
+// /api/v3/chat/completions），拿上游路径去匹配只会得到「配了却不生效」，
+// 而且不会有任何报错。
+func (g *Gateway) earlyFirstEvent(st *state) []byte {
+	if !g.cfg.Stream.EarlyFirstEvent {
+		return nil
+	}
+	return protocol.Preamble(st.route, st.publicModel)
 }
 
 // pipeBuffered 处理非流式响应：整体读入后做字段级脱敏。

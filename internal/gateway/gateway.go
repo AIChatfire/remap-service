@@ -116,7 +116,14 @@ type state struct {
 	bytesOut  int64
 	sseEvents int64
 	rewrites  int64
-	err       error
+	// preamble 标记本次流式响应开头是否合成下发了一个空首事件
+	// （STREAM_EARLY_FIRST_EVENT）；preambleBytes 是它的字节数。
+	//
+	// 两者都恒进日志与 span：没有它们，「首字变快了」与「上游真的变快了」
+	// 在看板上完全同形，而这恰恰是本开关最容易被误读的地方。
+	preamble      bool
+	preambleBytes int
+	err           error
 	// mx 是本次请求实际使用的指标集合。命中 EXCLUDED_URLS 时它是空集合，
 	// 所有上报退化为 no-op —— 排除判断只在 ServeHTTP 入口做一次。
 	mx *obs.Metrics
@@ -660,6 +667,13 @@ func (g *Gateway) log(st *state, status int, r *http.Request) {
 	}
 	if st.stream {
 		attrs = append(attrs, slog.Int64("sse_events", st.sseEvents))
+		// 只在真的注入了才打这两个字段：未开启时每条流多两列常量没有价值，
+		// 而排查「首字怎么突然变快了」时，它们就是那个缺席的答案。
+		if st.preamble {
+			attrs = append(attrs,
+				slog.Bool("preamble", true),
+				slog.Int("preamble_bytes", st.preambleBytes))
+		}
 	}
 	if !st.caps.Empty() {
 		attrs = append(attrs, slog.String("caps", st.caps.String()))

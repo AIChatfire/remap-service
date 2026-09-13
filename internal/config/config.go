@@ -32,6 +32,7 @@ type Config struct {
 	Mapping   Mapping
 	Sanitize  Sanitize
 	Limits    Limits
+	Stream    Stream
 	Lifecycle Lifecycle
 	Obs       Obs
 }
@@ -215,6 +216,24 @@ type Limits struct {
 	MaxSanitizeBytes int64
 }
 
+// Stream 是流式响应的整形开关。
+type Stream struct {
+	// EarlyFirstEvent 打开后，网关在拿到上游流式响应头（2xx + text/event-stream）
+	// 的那一刻先下发一个内容为空的首事件，再开始透传上游的真实事件。
+	//
+	// 它把下游按「收到第一个 SSE 事件」计的首字/TTFT，从「上游吐出第一个
+	// token 的时刻」提前到「上游返回响应头的时刻」—— 也就是说，那个数字
+	// 不再等于模型的真实 TTFT，两者之差就是整段 prefill。开启前请确认
+	// 下游看板的语义可以接受这一点。网关每次注入都记
+	// gateway.stream.preamble，可据此把合成事件从首字统计里剔掉。
+	//
+	// 不改变任何真实内容、token 数与总时长；发给上游的请求也一字不变。
+	//
+	// 默认关闭：打开它得到的是**感知**上的首字变快，而任何基于首字的
+	// 容量/体验判断都会随之失真，属于需要部署方明确知情后才该打开的开关。
+	EarlyFirstEvent bool
+}
+
 // Transport 是传输层（连接池与 h2 健康检查）参数。
 //
 // 为什么单独成组，而不是继续由 MAX_CONNS 一个数字推导：早期版本把
@@ -391,6 +410,9 @@ func Load(envFile string) (*Config, error) {
 			MaxInflight:      envIntAllowZero("MAX_INFLIGHT", 4096),
 			MaxBodyBytes:     envBytes("MAX_BODY_BYTES", 64<<20),
 			MaxSanitizeBytes: envBytes("MAX_SANITIZE_BYTES", 32<<20),
+		},
+		Stream: Stream{
+			EarlyFirstEvent: envBool("STREAM_EARLY_FIRST_EVENT", false),
 		},
 		Lifecycle: Lifecycle{
 			// 用 AllowZero：0 是「不等待、立刻关停」的有效取值（无 LB 的场景）。
@@ -578,6 +600,10 @@ func (c *Config) Summary() []any {
 		"first_byte_timeout", c.Upstream.FirstByteTimeout.String(),
 		"first_byte_timeout_nonstream", c.Upstream.FirstByteTimeoutNonStream.String(),
 		"stall_timeout", c.Upstream.StallTimeout.String(),
+		// 打开后下游的首字不再是模型的真实 TTFT，而等于「上游返回响应头」
+		// 这一时刻。这种「数字含义被改掉」的开关必须能在启动日志里一眼看到，
+		// 否则排查「首字怎么突然变快了」只能靠翻 .env。
+		"early_first_event", c.Stream.EarlyFirstEvent,
 		// 传输层参数同样全部进启动日志，理由同上：键名写错不会有任何报错，
 		// 只会静默沿用内置默认，而表现是「改了半天没效果」。
 		// h2_idle_timeout 尤其要看一眼 —— 它小于非流式首字节预算时

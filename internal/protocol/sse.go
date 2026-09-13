@@ -147,6 +147,65 @@ func transformLine(line []byte, tr Transformer) (out []byte, rewrote, suppressed
 	return buf, true, report.Suppressed
 }
 
+// SanitizeEvent 把一段**本地构造**的、已按 SSE 分帧的完整事件，走一遍与上游
+// 字节**完全相同**的逐行脱敏路径。
+//
+// # 为什么需要它
+//
+// 网关会提前下发一个合成首事件（见 gateway 的 STREAM_EARLY_FIRST_EVENT）。
+// 它不是上游来的，因此天然不经过 PipeSSE —— 于是成了整条流里唯一一段
+// 「本进程构造、却能原样写进客户端响应」的字节。
+//
+// 只加一条「合成事件里必须是对外名」的断言是不够的：断言只能证明当前那行
+// 代码写对了，挡不住后续任何改动（改错字段、或将来往事件里补了上游的 id /
+// system_fingerprint）。这里让它走同一条路径之后，泄漏面从「约定」变成
+// 「结构上不成立」—— 尤其 model 字段会被 Spec 的 ModelPaths 规则**整体覆盖**
+// 为对外名，因此合成事件的 model 与正文的 model 必然一致，不可能自相矛盾。
+//
+// 返回原切片（而不是复制一份）当且仅当没有任何一行被改写，这样
+// 「未启用脱敏」与「载荷里没有上游标识」两条路径都保持零分配、逐字节一致。
+//
+// # 边界（写新构造器前必须知道）
+//
+// 与 PipeSSE 一样，**只处理 `data:` 行**：`event:` / `id:` / 注释行原样保留
+// （上游也不会把模型名写进那里，动它们只会破坏协议）。因此这条保证的边界是
+// 「data 载荷里的标识一定会被擦掉」，**不等于「任何字节都安全」**。
+// 今后往合成事件里加内容时，**非 data 行只能是常量**，绝不能拼接上游来的值。
+func SanitizeEvent(frame []byte, tr Transformer) []byte {
+	if tr == nil || len(frame) == 0 {
+		return frame
+	}
+	var out []byte // 惰性分配：真的有行被改写时才构建
+	rest := frame
+	for len(rest) > 0 {
+		i := bytes.IndexByte(rest, '\n')
+		line := rest
+		if i >= 0 {
+			line = rest[:i]
+		}
+		nl, rewrote, _ := transformLine(line, tr)
+		if rewrote && out == nil {
+			out = make([]byte, 0, len(frame)+len(frame)/4)
+			out = append(out, frame[:len(frame)-len(rest)]...)
+		}
+		if out != nil {
+			out = append(out, nl...)
+			if i >= 0 {
+				out = append(out, '\n')
+			}
+		}
+		if i < 0 {
+			rest = nil
+		} else {
+			rest = rest[i+1:]
+		}
+	}
+	if out == nil {
+		return frame
+	}
+	return out
+}
+
 // readLine 读取一整行（去掉行尾 \n 与 \r），处理超长行。
 func readLine(br *bufio.Reader) ([]byte, error) {
 	line, err := br.ReadSlice('\n')
