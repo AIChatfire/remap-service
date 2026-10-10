@@ -152,3 +152,60 @@ func TestPipeSSECountsSuppressed(t *testing.T) {
 		t.Errorf("Rewrote = %d, want 1", stats.Rewrote)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 错误响应专用入口(第二层防线)。
+//
+// 256B 长度阈值的存在理由是「长字符串 ≈ 模型生成内容,不能篡改回答」,
+// 这个假设只对 2xx 成立。4xx/5xx 的正文是上游程序写的错误信息而非生成
+// 内容,而上游的长错误 message(配额超限、多行校验错误)几乎必然超过
+// 阈值 —— 里面的真实模型名会原样透给终端用户。错误模式下阈值不再生效。
+// ---------------------------------------------------------------------------
+
+func TestSanitizeErrorIgnoresLengthLimit(t *testing.T) {
+	s := Detect("/v1/chat/completions")
+	rep := newLimitRep(t, "up-model", "public-model", 32)
+
+	long := strings.Repeat("quota exceeded for this account. ", 12) + "model up-model is over limit."
+	in := []byte(`{"error":{"message":"` + long + `","code":"429"}}`)
+
+	out, report := s.SanitizeError(in, "public-model", rep)
+	if !report.Changed {
+		t.Fatal("错误模式未改写任何字段")
+	}
+	if strings.Contains(string(out), "up-model") {
+		t.Errorf("错误模式仍泄漏上游模型: %.120s", out)
+	}
+	if !strings.Contains(string(out), "model public-model is over limit.") {
+		t.Errorf("长 message 中的模型名未被替换")
+	}
+}
+
+// 错误模式下长度信号不再有意义:阈值无限,不存在「被放行的长值」。
+func TestSanitizeErrorNeverSuppressed(t *testing.T) {
+	s := Detect("/v1/chat/completions")
+	rep := newLimitRep(t, "up-model", "public-model", 32)
+
+	long := strings.Repeat("x", 60) + " up-model"
+	in := []byte(`{"error":{"message":"` + long + `"}}`)
+	_, report := s.SanitizeError(in, "public-model", rep)
+	if report.Suppressed {
+		t.Error("错误模式下不应出现抑制信号(阈值不再放行任何值)")
+	}
+}
+
+// 常规入口不受影响:同样的长值走 2xx 语义时仍按阈值放行。
+func TestSanitizeRegularModeStillLimitsLength(t *testing.T) {
+	s := Detect("/v1/chat/completions")
+	rep := newLimitRep(t, "up-model", "public-model", 32)
+
+	long := strings.Repeat("x", 60) + " up-model"
+	in := []byte(`{"model":"public-model","note":"` + long + `"}`)
+	out, report := s.SanitizeWithReport(in, "public-model", rep)
+	if !report.Suppressed {
+		t.Error("常规模式下超长值仍应报告抑制(保护生成内容的语义未变)")
+	}
+	if !strings.Contains(string(out), long) {
+		t.Error("常规模式下超长值仍应原样放行")
+	}
+}

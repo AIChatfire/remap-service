@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"errors"
+	"math"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -74,13 +75,35 @@ type SanitizeReport struct {
 //
 // 不关心抑制信号的调用方用这个包装即可。
 func (s *Spec) Sanitize(body []byte, public string, rep *sanitize.Replacer) ([]byte, bool) {
-	out, report := s.SanitizeWithReport(body, public, rep)
+	out, report := s.sanitize(body, public, rep, rep.MaxValueLen())
 	return out, report.Changed
 }
 
 // SanitizeWithReport 与 Sanitize 相同，但额外回报「被跳过的漏点」。
 func (s *Spec) SanitizeWithReport(
 	body []byte, public string, rep *sanitize.Replacer,
+) ([]byte, SanitizeReport) {
+	return s.sanitize(body, public, rep, rep.MaxValueLen())
+}
+
+// SanitizeError 是错误响应（4xx/5xx）专用的脱敏入口：长度阈值不再生效。
+//
+// 阈值（SANITIZE_MAX_VALUE_LEN）的存在理由是「长字符串 ≈ 模型生成的
+// 内容，替换它等于篡改用户的回答」。这个假设只对 2xx 成立 —— 错误正文
+// 是上游程序写的，不是模型生成的；而上游的长错误 message（配额超限、
+// 多行校验错误、回显了整个请求的 400）几乎必然超过阈值，其间的真实模型
+// 名正是最需要脱敏的内容。对错误响应保留阈值，等于给泄漏开后门。
+//
+// 体积上限不受影响：整体仍被 MAX_SANITIZE_BYTES 卡住，这里只是不再对
+// 单个字符串值设限。
+func (s *Spec) SanitizeError(
+	body []byte, public string, rep *sanitize.Replacer,
+) ([]byte, SanitizeReport) {
+	return s.sanitize(body, public, rep, math.MaxInt)
+}
+
+func (s *Spec) sanitize(
+	body []byte, public string, rep *sanitize.Replacer, maxLen int,
 ) ([]byte, SanitizeReport) {
 	out := body
 	var report SanitizeReport
@@ -114,7 +137,7 @@ func (s *Spec) SanitizeWithReport(
 	// 抑制信号只在「确实扫过」的前提下才可信：MayMatch 判负说明整段文本里
 	// 根本没有上游标识，此时零替换是正确结果，不是漏点。
 	if !rep.Noop() && rep.MayMatch(out) {
-		v, ok, suppressed := scanAndReplace(out, rep, covered)
+		v, ok, suppressed := scanAndReplace(out, rep, covered, maxLen)
 		report.Suppressed = suppressed
 		if ok {
 			out, report.Changed = v, true
@@ -127,18 +150,21 @@ func (s *Spec) SanitizeWithReport(
 //
 // 判定条件（全部满足才替换）：
 //   - 值是字符串且包含待替换的源串；
-//   - 值长度不超过 rep.MaxValueLen()；
+//   - 值长度不超过 maxLen（2xx 路径为 SANITIZE_MAX_VALUE_LEN，
+//     错误路径为无限 —— 见 SanitizeError）；
 //   - 所在字段名不在生成内容白名单里（content / text / delta …）；
 //   - 所在路径不在 covered 里（已被模型字段覆盖步骤处理过）。
 //
 // 第三个返回值 suppressed 表示本次遇到过「含上游标识、但被长度阈值放行」
 // 的值 —— 即真正的静默漏点。它与 ok 可以同时为真：一次响应里既有被改写
 // 的短值，也有被放行的长值。
-func scanAndReplace(body []byte, rep *sanitize.Replacer, covered []string) (out []byte, ok, suppressed bool) {
+func scanAndReplace(
+	body []byte, rep *sanitize.Replacer, covered []string, maxLen int,
+) (out []byte, ok, suppressed bool) {
 	var paths []string
 	var values []string
 
-	collect(gjson.ParseBytes(body), "", "", rep, covered, 0, &paths, &values, &suppressed)
+	collect(gjson.ParseBytes(body), "", "", rep, covered, maxLen, 0, &paths, &values, &suppressed)
 	if len(paths) == 0 {
 		return body, false, suppressed
 	}
@@ -161,7 +187,7 @@ func scanAndReplace(body []byte, rep *sanitize.Replacer, covered []string) (out 
 // 且只对非生成内容字段生效，因此代价只在「出现超长非内容字符串」这种
 // 低频形态上产生 —— 热路径（SSE 增量 chunk）不会走到这里。
 func collect(
-	v gjson.Result, path, key string, rep *sanitize.Replacer, covered []string,
+	v gjson.Result, path, key string, rep *sanitize.Replacer, covered []string, maxLen int,
 	depth int, paths, values *[]string, suppressed *bool,
 ) {
 	if depth > maxScanDepth {
@@ -175,10 +201,11 @@ func collect(
 		if isCovered(path, covered) {
 			return // 模型字段已整体覆盖，二次子串替换只会产生重复片段
 		}
-		if len(v.Str) > rep.MaxValueLen() {
+		if len(v.Str) > maxLen {
 			// 过长，视为生成内容而放行 —— 这是有意的，但它是**静默**的：
 			// 上游的长错误 message 正落在这个区间（配额超限、多行校验错误、
 			// 回显了整个请求的 400），而它们往往含真实上游模型名。
+			// 错误路径（SanitizeError）的 maxLen 为无限，不会走到这里。
 			// 这里顺手判一次「里面到底有没有标识」，把静默漏点变成可测量
 			// 的计数；判定只在已经超长的值上发生，不影响热路径。
 			if rep.MayMatchString(v.Str) {
@@ -195,7 +222,7 @@ func collect(
 		if v.IsArray() {
 			i := 0
 			v.ForEach(func(_, item gjson.Result) bool {
-				collect(item, joinIndex(path, i), key, rep, covered, depth+1, paths, values, suppressed)
+				collect(item, joinIndex(path, i), key, rep, covered, maxLen, depth+1, paths, values, suppressed)
 				i++
 				return true
 			})
@@ -203,7 +230,7 @@ func collect(
 		}
 		v.ForEach(func(k, item gjson.Result) bool {
 			name := k.String()
-			collect(item, joinKey(path, name), name, rep, covered, depth+1, paths, values, suppressed)
+			collect(item, joinKey(path, name), name, rep, covered, maxLen, depth+1, paths, values, suppressed)
 			return true
 		})
 	}

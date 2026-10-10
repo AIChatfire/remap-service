@@ -376,3 +376,27 @@ func TestNumericSuffixVariantEqualToPublicIsDropped(t *testing.T) {
 		t.Fatalf("全名未替换: %q", got)
 	}
 }
+
+// 词表只有系列名时,正文里「系列名 + 新日期段」的形态必须整体替换,不留尾巴。
+// 上游随时会给出比映射登记时更新的日期后缀,逐个登记别名追不上;命中后吞掉
+// 单个 6-8 位纯数字日期段,把「词表内前缀 + 日期尾巴」一次收干净。
+func TestSwallowTrailingDateSegment(t *testing.T) {
+	r := NewRules(nil, nil, nil, 0)
+	p := r.For("doubao-seed-2-1-lite", "pub")
+
+	if got := p.Apply("model doubao-seed-2-1-lite-260915 is over quota"); got != "model pub is over quota" {
+		t.Errorf("日期段尾未吞掉: %q", got)
+	}
+	if got := p.Apply("doubao-seed-2-1-lite-260915-260916"); got != "pub-260916" {
+		t.Errorf("只应吞掉一个日期段: %q", got)
+	}
+	// 语义后缀不是日期段:保持「替换前缀、保留尾巴」的既有行为,
+	// 不把别的模型名也吞进来。
+	if got := p.Apply("model doubao-seed-2-1-lite-pro"); got != "model pub-pro" {
+		t.Errorf("语义后缀处理意外: %q", got)
+	}
+	// 已是对外形态时不得误吞:对外名(带自己的日期段)保持原样。
+	if got := p.Apply("model pub-260428"); got != "model pub-260428" {
+		t.Errorf("对外形态被误改: %q", got)
+	}
+}

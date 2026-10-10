@@ -172,6 +172,29 @@ func (m *foldMatcher) mayMatch(s string) bool {
 	return false
 }
 
+// trailingDateSegment 返回 seg 开头「- + 6~8 位纯数字」段的字节长度，
+// 非该形态返回 0。段长以「数字后紧跟的字符」判定：第 9 位仍是数字说明
+// 这不是日期段，整段不动。
+//
+// 只在替换命中后调用（每个命中一次），不在扫描热路径上。
+func trailingDateSegment(seg string) int {
+	if len(seg) < 7 || seg[0] != '-' {
+		return 0
+	}
+	i := 1
+	for i < len(seg) && i <= 8 && seg[i] >= '0' && seg[i] <= '9' {
+		i++
+	}
+	n := i - 1 // 纯数字位数
+	if n < 6 || n > 8 {
+		return 0
+	}
+	if i < len(seg) && seg[i] >= '0' && seg[i] <= '9' {
+		return 0 // ≥9 位数字：不是日期段
+	}
+	return i
+}
+
 // replace 执行替换。无实际改动时返回原字符串，不产生分配。
 func (m *foldMatcher) replace(s string) string {
 	if m == nil || m.minLen <= 0 || len(s) < m.minLen {
@@ -199,6 +222,12 @@ func (m *foldMatcher) replace(s string) string {
 			i += skip
 			continue
 		}
+		// 命中后吞掉紧跟的单个日期段（6-8 位纯数字）：上游报错里会出现
+		// 「词表内名字 + 比登记时更新的日期段」的形态（如词表登记了系列名
+		// doubao-seed-2-1-lite，正文却是 doubao-seed-2-1-lite-260915），
+		// 留下尾巴等于半脱敏。只认日期形态：语义后缀（-pro、-mini）是
+		// 别的模型的正式组成部分，不吞。
+		end += trailingDateSegment(s[end:])
 		if b.Cap() == 0 {
 			b.Grow(len(s) + len(p.dst))
 		}

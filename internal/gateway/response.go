@@ -281,10 +281,21 @@ func (g *Gateway) pipeBuffered(
 	// needSanitize 必须重新判断：4xx/5xx 会绕过上面的直通分支走到这里，
 	// 此时 rep 可能为 nil（脱敏关闭或请求无 model 字段），无条件调用
 	// Sanitize 等于在关闭脱敏的部署里悄悄启用它。
+	//
+	// 错误响应走 SanitizeError（长度阈值不生效）：4xx/5xx 的正文是上游
+	// 程序写的错误信息而非模型生成内容，长错误 message 里恰恰最可能藏着
+	// 真实模型名 —— 保留阈值等于给泄漏开后门。2xx 仍走常规模式，
+	// 「长字符串 ≈ 生成内容」的保护语义不变。
 	out := body
 	suppressed := false
 	if needSanitize && protocol.LooksLikeJSON(body) {
-		nb, report := spec.SanitizeWithReport(body, st.publicModel, rep)
+		var nb []byte
+		var report protocol.SanitizeReport
+		if resp.StatusCode >= 400 {
+			nb, report = spec.SanitizeError(body, st.publicModel, rep)
+		} else {
+			nb, report = spec.SanitizeWithReport(body, st.publicModel, rep)
+		}
 		suppressed = report.Suppressed
 		if report.Changed {
 			out = nb

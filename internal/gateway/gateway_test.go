@@ -1306,3 +1306,29 @@ func TestNoFailoverAfterStreamStarted(t *testing.T) {
 func gjsonModel(b []byte) string {
 	return gjson.GetBytes(b, "model").String()
 }
+
+// 第二层防线(管道级):错误响应不受 256B 长度阈值限制 —— 上游长错误
+// message 里的真实模型名也必须被替换。4xx 正文不是模型生成内容,
+// 「长」不再是放行的理由。
+func TestErrorBodyLongMessageSanitized(t *testing.T) {
+	longMsg := strings.Repeat("The request quota has been exceeded for this account. ", 8) + "Affected model: deepseek-v3-250101."
+	gs, _ := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"` + longMsg + `","type":"rate_limit_error"}}`))
+	}, nil)
+
+	resp := post(t, gs, "/v1/chat/completions", `{"model":"deepseek-pro"}`,
+		map[string]string{MapHeader: "deepseek-pro:deepseek-v3"})
+	body := readAll(t, resp)
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", resp.StatusCode)
+	}
+	if strings.Contains(body, "deepseek-v3") {
+		t.Errorf("长错误 message 泄漏上游模型: %.160s", body)
+	}
+	if !strings.Contains(body, "Affected model: deepseek-pro.") {
+		t.Errorf("长 message 未替换: %.160s", body)
+	}
+}
