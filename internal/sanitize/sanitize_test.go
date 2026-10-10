@@ -298,3 +298,81 @@ func TestForConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// 系列名变体：上游报错按「模型系列」回显，形态与请求用的全名不同。
+//
+// 事故（2026-10-10）：X-Model-Map wildcard 把对外名 doubao-seed-2-0-lite-260428
+// 映射为上游全名 doubao-seed-2-1-lite-260915；火山 TPM 限流按系列计，
+// 429 正文回显的是不带日期后缀的 doubao-seed-2-1-lite —— 词表里只有全名，
+// 匹配不上，错误正文原样透给终端用户。
+// ---------------------------------------------------------------------------
+
+// 事故形态的直接复现：系列名必须被替换，MayMatch（SanitizeWithReport 的
+// 剪枝门）也必须放行 —— 判负的话 scanAndReplace 根本不会跑，照样泄漏。
+func TestNumericSuffixVariantCatchesSeriesName(t *testing.T) {
+	r := NewRules(nil, nil, nil, 0)
+	p := r.For("doubao-seed-2-1-lite-260915", "doubao-seed-2-0-lite-260428")
+
+	in := "TPM (Tokens Per Minute) limit of the model doubao-seed-2-1-lite is exceeded."
+	want := "TPM (Tokens Per Minute) limit of the model doubao-seed-2-0-lite-260428 is exceeded."
+	if got := p.Apply(in); got != want {
+		t.Fatalf("系列名未被替换:\n got %q\nwant %q", got, want)
+	}
+	if !p.MayMatchString(in) {
+		t.Fatal("MayMatch 对系列名判负 —— SanitizeWithReport 会被剪枝,替换永远不执行")
+	}
+}
+
+// 全名优先于变体：带日期后缀的形态仍被长规则整体吃掉,不留尾巴。
+func TestNumericSuffixVariantLongNameStillWins(t *testing.T) {
+	r := NewRules(nil, nil, nil, 0)
+	p := r.For("doubao-seed-2-1-lite-260915", "doubao-seed-2-0-lite-260428")
+
+	if got := p.Apply("quota exhausted for doubao-seed-2-1-lite-260915 tonight"); got != "quota exhausted for doubao-seed-2-0-lite-260428 tonight" {
+		t.Fatalf("全名未整体替换: %q", got)
+	}
+}
+
+// 变体派生只认「日期段」形态（6-8 位纯数字尾段），避免把模型名的
+// 正式组成部分误当代号摘掉。
+func TestNumericSuffixVariantDoesNotOverreach(t *testing.T) {
+	r := NewRules(nil, nil, nil, 0)
+	// 尾段 70b 非纯数字；2024 只有 4 位 —— 均不派生变体。断言对象是
+	// 正文里的**派生形态**（llama-3 / gpt-4o）：全名命中是既有职责，
+	// 与变体无关。
+	for _, tc := range [][2]string{
+		{"llama-3-70b", "llama-3"},
+		{"gpt-4o-2024", "gpt-4o"},
+	} {
+		p := r.For(tc[0], "pub")
+		if got := p.Apply("about " + tc[1]); got != "about "+tc[1] {
+			t.Errorf("For(%q) 不应派生变体 %q,却替换了正文: %q", tc[0], tc[1], got)
+		}
+	}
+	// 6 位与 8 位日期段均应派生。
+	for _, tc := range [][2]string{
+		{"doubao-seed-2-1-lite-260915", "doubao-seed-2-1-lite"},
+		{"claude-3-5-20241120", "claude-3-5"},
+	} {
+		p := r.For(tc[0], "pub")
+		if got := p.Apply("model " + tc[1] + " is over quota"); got != "model pub is over quota" {
+			t.Errorf("For(%q): 变体 %q 未被替换: %q", tc[0], tc[1], got)
+		}
+	}
+}
+
+// 派生出的变体恰好等于对外名时不得入表：否则会把已是对外形态的正文
+// 再「替换」一次（alreadyTarget 能兜住,但规则本身就是多余的噪声）。
+func TestNumericSuffixVariantEqualToPublicIsDropped(t *testing.T) {
+	r := NewRules(nil, nil, nil, 0)
+	p := r.For("foo-bar-123456", "foo-bar")
+
+	if got := p.Apply("using foo-bar now"); got != "using foo-bar now" {
+		t.Fatalf("对外名形态被改写: %q", got)
+	}
+	// 全名仍正常替换 —— 目标形态就是对外名本身。
+	if got := p.Apply("using foo-bar-123456 now"); got != "using foo-bar now" {
+		t.Fatalf("全名未替换: %q", got)
+	}
+}

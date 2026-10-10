@@ -382,6 +382,17 @@ func (r *Rules) build(upstream, public string) *Replacer {
 			srcs = append(srcs, a)
 		}
 	}
+	// 系列名变体：上游的限流/配额报错常按「去掉日期尾段的系列名」回显，
+	// 与请求实际使用的全名不同形。实测事故（2026-10-10）：映射把
+	// doubao-seed-2-0-lite-260428 发为 doubao-seed-2-1-lite-260915，火山 TPM
+	// 按系列计，429 正文回显 doubao-seed-2-1-lite —— 词表里只有全名时
+	// 匹配不上，错误正文带着真实系列名原样透给终端用户。
+	// 派生放在去重之前：别名派生出的系列名与主名重复时由 seen 收敛。
+	for _, s := range srcs {
+		if v := numericTailVariant(s); v != "" && v != public {
+			srcs = append(srcs, v)
+		}
+	}
 
 	// 精确去重。不按小写折叠：折叠后 deepseek-v3 与 DeepSeek-V3 看似等价，
 	// 但当对外名恰是其中一种形态时，留错那一条会让另一种形态漏过。重复的
@@ -421,6 +432,34 @@ func (r *Rules) build(upstream, public string) *Replacer {
 		public:      public,
 		maxValueLen: r.maxValueLen,
 	}
+}
+
+// numericTailVariant 返回去掉「日期尾段」后的系列名形态，非该形态返回空串。
+//
+// 尾段限定 6-8 位纯数字（YYMMDD / YYYYMMDD）：这是各家模型名日期代号的
+// 实际形态（doubao-seed-2-1-lite-260915、claude-3-5-20241120）。放得更宽
+// —— 比如收下 4 位年份或短版本号 —— 会把模型名的正式组成部分
+// （gpt-4o-2024、llama-3-70b）误当代号摘掉，让正文里正常的名称段被
+// 替换成对外名，反而篡改了上游的原意。
+//
+// 返回值恒为 s 的严格前缀，因此不可能是自身；与主名重复的情况由
+// build 的去重收敛。全名与变体同表时，长串优先排序保证全名先匹配，
+// 不会留下 "-260915" 之类的尾巴。
+func numericTailVariant(s string) string {
+	i := strings.LastIndexByte(s, '-')
+	if i < 0 {
+		return ""
+	}
+	tail := s[i+1:]
+	if len(tail) < 6 || len(tail) > 8 {
+		return ""
+	}
+	for j := 0; j < len(tail); j++ {
+		if tail[j] < '0' || tail[j] > '9' {
+			return ""
+		}
+	}
+	return s[:i]
 }
 
 // sortByLenDesc 按长度降序排序，等长时按字典序，保证结果稳定。
