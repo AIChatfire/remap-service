@@ -1,0 +1,49 @@
+# remap-service · ai-prod 部署声明（2026-10-10）
+#
+# 与 apps（154.40.45.22，remap.oneapis.cn）同源：.env 不入库，从 apps
+# /www/server/panel/data/compose/remap/.env 拷贝后按 README「差异项」调整。
+# 镜像 public（ghcr.io/aichatfire/remap-service）⇒ 节点直接 pull，
+# **钉语义化版本，不用 latest**（GHCR tag 无 v 前缀：0.1.30 对应 git tag v0.1.30）。
+name: remap
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  gateway:
+    image: ghcr.io/aichatfire/remap-service:${REMAP_IMAGE_TAG:-0.1.30}
+    container_name: remap
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 红线：只绑回环。网关无准入鉴权（凭据纯透传），绑 0.0.0.0 = 公网裸奔；
+      # 公网入口一律 nginx remap.1task.cn（见 nginx/）。
+      - "127.0.0.1:39030:8080"
+    healthcheck:
+      # distroless 无 shell/curl，存活探针由二进制自探（-healthcheck 打本机 /healthz）。
+      # 别拿 -check 当健康检查：那是启动期静态配置校验，与进程死活无关。
+      test: ["CMD", "/gateway", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # 内存上限 = GOMEMLIMIT 唯一基准（进程读 cgroup ×80%，internal/memlimit）。
+    # ai-prod 新实例流量未知，先 4g；看板 gateway.requests 持续走高再调，
+    # 调的时候连同 MAX_INFLIGHT 一起看（apps 主力实例是 16g/10240）。
+    mem_limit: ${CONTAINER_MEMORY:-4g}
+    memswap_limit: ${CONTAINER_MEMORY:-4g}
+    # 必须 ≥ 退出预算（SHUTDOWN_* 三段之和，.env 启动日志 shutdown_budget_total 可核）。
+    stop_grace_period: 45s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+    read_only: true          # 镜像只有静态二进制，运行期无需写盘
+    cap_drop:
+      - ALL
+    logging: *default-logging
