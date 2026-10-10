@@ -548,6 +548,37 @@ func TestErrorBodySanitizedStatusPreserved(t *testing.T) {
 	}
 }
 
+// 事故形态（2026-10-10）的管道级防线：映射把对外名发为上游**全名**
+// （带日期尾段），上游限流按「系列名」回显（不带尾段）。整条管道
+// （needSanitize 判定 → SanitizeWithReport → 变体派生）必须把系列名
+// 也换回对外名，且保留上游的 429 状态码。
+func TestErrorBodySeriesNameSanitizedThroughPipeline(t *testing.T) {
+	gs, _ := newFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		// 断言映射发生在请求侧：上游收到的是全名（带日期尾段）。
+		reqBody, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(reqBody), `"model":"doubao-seed-2-1-lite-260915"`) {
+			t.Errorf("上游应收到全名,实际: %s", reqBody)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"TPM limit of the model doubao-seed-2-1-lite is exceeded.","type":"rate_limit_error"}}`))
+	}, nil)
+
+	resp := post(t, gs, "/v1/chat/completions", `{"model":"doubao-seed-2-0-lite-260428"}`,
+		map[string]string{MapHeader: "doubao-seed-2-0-lite-260428:doubao-seed-2-1-lite-260915"})
+	body := readAll(t, resp)
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", resp.StatusCode)
+	}
+	if strings.Contains(body, "doubao-seed-2-1-lite") {
+		t.Errorf("错误体泄漏上游系列名: %s", body)
+	}
+	if !strings.Contains(body, "TPM limit of the model doubao-seed-2-0-lite-260428 is exceeded.") {
+		t.Errorf("系列名未还原为对外名: %s", body)
+	}
+}
+
 func TestSanitizeOff(t *testing.T) {
 	gs, _ := newFixture(t, okJSON(`{"model":"deepseek-v3"}`),
 		func(c *config.Config) { c.Sanitize.Off = true })
